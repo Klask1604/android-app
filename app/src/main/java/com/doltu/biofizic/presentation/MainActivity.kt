@@ -27,6 +27,7 @@ import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import android.content.Intent
 
 class MainActivity : ComponentActivity(), SensorEventListener {
 
@@ -41,15 +42,20 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     // Launcher modern pentru permisiuni (înlocuiește requestPermissions deprecated)
     private val permissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) registerSensors()
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val bodySensors = permissions[Manifest.permission.BODY_SENSORS] == true
+        val heartRate = permissions["android.permission.health.READ_HEART_RATE"] == true
+        if (bodySensors || heartRate) registerSensors()
         else statusState.value = "Permisiune refuzata"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
         super.onCreate(savedInstanceState)
+
+        // Inițializează ÎNTOTDEAUNA sensorManager aici, indiferent de permisiune
+        sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
 
         setContent {
             WearApp(
@@ -59,26 +65,21 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             )
         }
 
-        if (checkSelfPermission(Manifest.permission.BODY_SENSORS)
-            == PackageManager.PERMISSION_GRANTED) {
-            registerSensors()
-        } else {
-            permissionLauncher.launch(Manifest.permission.BODY_SENSORS)
-        }
+        checkAndRequestPermission()
+    }
+
+    private fun checkAndRequestPermission() {
+        permissionLauncher.launch(arrayOf(
+            Manifest.permission.BODY_SENSORS,
+            Manifest.permission.BODY_SENSORS_BACKGROUND,
+            "android.permission.health.READ_HEART_RATE"
+        ))
     }
 
     private fun registerSensors() {
         statusState.value = "Activ"
-
-        sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
-
-        sensorManager.getDefaultSensor(Sensor.TYPE_HEART_RATE)?.also {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
-        }
-
-        sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.also {
-            sensorManager.registerListener(this, it, 20_000) // 50Hz
-        }
+        val intent = Intent(this, SensorService::class.java)
+        startForegroundService(intent)
     }
 
     override fun onSensorChanged(event: SensorEvent) {
