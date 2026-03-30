@@ -126,13 +126,16 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     override fun onPause() {
         super.onPause()
-        sensorManager.unregisterListener(this)
-        statusState.value = "Pauza"
+        if (::sensorManager.isInitialized) {
+            sensorManager.unregisterListener(this)
+            statusState.value = "Pauza"
+        }
     }
 
     override fun onResume() {
         super.onResume()
-        if (checkSelfPermission(Manifest.permission.BODY_SENSORS)
+        if (::sensorManager.isInitialized &&
+            checkSelfPermission(Manifest.permission.BODY_SENSORS)
             == PackageManager.PERMISSION_GRANTED) {
             registerSensors()
         }
