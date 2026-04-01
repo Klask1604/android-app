@@ -57,4 +57,8 @@ dependencies {
     debugImplementation(libs.ui.tooling)
     debugImplementation(libs.ui.test.manifest)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar"))))}
+    implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar"))))
+    implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
+    implementation(libs.compose.material)
+    implementation("androidx.wear:wear:1.3.0")
+}
