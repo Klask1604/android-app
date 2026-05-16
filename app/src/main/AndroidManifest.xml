@@ -13,6 +13,12 @@
     <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
     <uses-permission android:name="android.permission.health.READ_HEART_RATE" />
     <uses-permission android:name="android.permission.health.READ_HEART_RATE_VARIABILITY" />
+    <uses-permission android:name="android.permission.health.READ_ELECTROCARDIOGRAM" />
+    <uses-permission android:name="android.permission.health.READ_SKIN_TEMPERATURE" />
+    <uses-permission android:name="android.permission.health.READ_OXYGEN_SATURATION" />
+    <uses-permission android:name="android.permission.health.READ_BODY_TEMPERATURE" />
+    <!-- PPG, BIA, ECG etc. – obligatoriu targetSdk 36+ (Samsung Health Sensor SDK) -->
+    <uses-permission android:name="com.samsung.android.hardware.sensormanager.permission.READ_ADDITIONAL_HEALTH_DATA" />
     <uses-permission android:name="com.samsung.android.providers.context.permission.WRITE_USE_APP_FEATURE_SURVEY" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
@@ -41,7 +47,7 @@
 
         <meta-data
             android:name="com.samsung.android.health.permission.read"
-            android:value="com.samsung.health.heart_rate" />
+            android:value="com.samsung.health.heart_rate;com.samsung.health.heart_rate.variability;com.samsung.health.skin_temperature;com.samsung.health.electrocardiogram;com.samsung.health.oxygen_saturation;com.samsung.health.accelerometer;com.samsung.health.ppg_green;com.samsung.health.ppg_red;com.samsung.health.ppg_ir;com.samsung.health.bia;com.samsung.health.sweat_loss" />
 
         <activity
             android:name=".presentation.MainActivity"
