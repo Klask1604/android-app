@@ -85,24 +85,46 @@ class SensorService : Service(), SensorEventListener {
          * Eșantioanele se acumulează și pleacă într-un singur mesaj per topic.
          * Senzorul Samsung tot măsoară la rata lui (ex. PPG ~25 Hz); MQTT doar la 1 s.
          */
+        /** Batch PPG/IBI/HR pe MQTT (1 s). */
         @Volatile var mqttPublishIntervalMs = 1_000L
+        /** HRV + features pentru clasificator (500 ms). */
+        @Volatile var hrvPublishIntervalMs = 500L
 
         /** PPG: câte un mesaj MQTT per eșantion pe biofizic/ppg/stream (pentru semnal + jitter). */
-        @Volatile var ppgStreamEnabled = true
+        @Volatile var ppgStreamEnabled = false
+
+        @Volatile var lastSkinTempC = 0.0
+        @Volatile var lastAmbientTempC = 0.0
 
         @Volatile var displayOn = true
         @Volatile var backgroundSensorsGranted = false
         @Volatile var lastRmssd = 0.0
 
-        private const val MAX_IBI_WINDOW = 120
+        /** Din biofizic/state (clasificator v2 pe VPS). */
+        @Volatile var arousal10 = -1
+        @Volatile var arousalConfidence = 0f
+        @Volatile var emotionLabel = "—"
+        @Volatile var motionGated = false
+        @Volatile var profileReady = false
+        @Volatile var signalOk = false
+        @Volatile var lastWindowSec = 0.0
+        @Volatile var lastStateMessageMs = 0L
+
+        private const val MAX_IBI_ENTRIES = 200
+        private const val IBI_RETENTION_MS = 90_000L
+        /** Fereastră HRV: ultimele 60 s (timp perete). */
+        private const val HRV_WINDOW_MS = 60_000L
+        private const val MIN_IBI_FOR_HRV = 12
+        private const val MIN_WINDOW_SEC_FOR_SIGNAL = 10.0
         private const val MAX_ACC_MAGNITUDES = 64
     }
 
     private var scanOnlyMode = false
     private var screenReceiverRegistered = false
     private var displayOnLocal = true
-    private val ibiWindowMs = ArrayDeque<Int>(180)
+    private val ibiWindow = ArrayDeque<IbiWindowEntry>(220)
     private val accMagnitudes = mutableListOf<Double>()
+    @Volatile private var lastIbiTimestampMs = 0L
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -123,6 +145,7 @@ class SensorService : Service(), SensorEventListener {
     private var lastStepJson: String? = null
 
     private var sdkFlushLoopRunning = false
+    private var hrvPublishLoopRunning = false
     private var mqttPublishLoopRunning = false
 
     private val sdkFlushRunnable = object : Runnable {
@@ -139,13 +162,23 @@ class SensorService : Service(), SensorEventListener {
         }
     }
 
+    private val hrvPublishRunnable = object : Runnable {
+        override fun run() {
+            if (!isRunning) {
+                hrvPublishLoopRunning = false
+                return
+            }
+            publishHrvFeatures()
+            handler.postDelayed(this, hrvPublishIntervalMs)
+        }
+    }
+
     private val mqttPublishRunnable = object : Runnable {
         override fun run() {
             if (!isRunning) {
                 mqttPublishLoopRunning = false
                 return
             }
-            publishHrvFeatures()
             flushAllMqttBuffers()
             logPeriodicStatus()
             handler.postDelayed(this, mqttPublishIntervalMs)
@@ -207,7 +240,7 @@ class SensorService : Service(), SensorEventListener {
             Log.i(
                 TAG,
                 "Status: ecran=${if (displayOn) "ON" else "OFF"}, bg=$backgroundSensorsGranted, " +
-                    "ibiWindow=${ibiWindowMs.size}, rmssd=${"%.1f".format(lastRmssd)}, mqtt=$msgCount"
+                    "ibiWindow=${ibiWindow.size}, windowSec=${"%.0f".format(lastWindowSec)}, signalOk=$signalOk, rmssd=${"%.1f".format(lastRmssd)}, mqtt=$msgCount"
             )
         }
     }
@@ -217,6 +250,10 @@ class SensorService : Service(), SensorEventListener {
             sdkFlushLoopRunning = true
             handler.post(sdkFlushRunnable)
         }
+        if (!hrvPublishLoopRunning) {
+            hrvPublishLoopRunning = true
+            handler.post(hrvPublishRunnable)
+        }
         if (!mqttPublishLoopRunning) {
             mqttPublishLoopRunning = true
             handler.post(mqttPublishRunnable)
@@ -225,8 +262,10 @@ class SensorService : Service(), SensorEventListener {
 
     private fun stopPublishLoops() {
         sdkFlushLoopRunning = false
+        hrvPublishLoopRunning = false
         mqttPublishLoopRunning = false
         handler.removeCallbacks(sdkFlushRunnable)
+        handler.removeCallbacks(hrvPublishRunnable)
         handler.removeCallbacks(mqttPublishRunnable)
     }
 
@@ -278,28 +317,40 @@ class SensorService : Service(), SensorEventListener {
                     )
                 }
 
+                if (status != 1) continue
+
                 val ibiList = dp.getValue(ValueKey.HeartRateSet.IBI_LIST)
+                val ibiStatusList = dp.getValue(ValueKey.HeartRateSet.IBI_STATUS_LIST)
                 if (ibiList != null) {
-                    for (ibi in ibiList) {
-                        if (ibi > 0) {
-                            synchronized(bufferLock) {
-                                ibiWindowMs.addLast(ibi)
-                                while (ibiWindowMs.size > MAX_IBI_WINDOW) {
-                                    ibiWindowMs.removeFirst()
-                                }
-                            }
+                    synchronized(bufferLock) {
+                        for (i in ibiList.indices) {
+                            val ibi = ibiList[i]
+                            val ibiStatus = ibiStatusList?.getOrNull(i)
+                            val recent = ibiWindow.map { it.ibiMs }
+                            if (!IbiSignalFilter.accept(ibi, ibiStatus, recent)) continue
+                            val ts = dp.timestamp.takeIf { it > 0 } ?: System.currentTimeMillis()
+                            ibiWindow.addLast(IbiWindowEntry(ibi, ts))
+                            lastIbiTimestampMs = System.currentTimeMillis()
+                            trimIbiWindow()
                             enqueueSample(
                                 ibiSamples,
-                                """{"ts":${dp.timestamp},"ibi":$ibi}"""
+                                """{"ts":${dp.timestamp},"ibi":$ibi,"st":${ibiStatus ?: 0}}"""
                             )
                         }
+                        IbiSignalFilter.sanitizeWindow(ibiWindow)
                     }
                 }
             }
         }
         override fun onFlushCompleted() {}
         override fun onError(e: HealthTracker.TrackerError) {
-            Log.e(TAG, "HR tracker eroare: ${e.name}")
+            Log.w(TAG, "HR tracker eroare: ${e.name} — restart în 3s")
+            ibiActive = false
+            heartRateTracker?.unsetEventListener()
+            heartRateTracker = null
+            handler.postDelayed({
+                if (isRunning) restartHrTracker()
+            }, 3_000L)
         }
     }
 
@@ -310,7 +361,13 @@ class SensorService : Service(), SensorEventListener {
         }
         override fun onFlushCompleted() {}
         override fun onError(e: HealthTracker.TrackerError) {
-            Log.e(TAG, "PPG tracker eroare: ${e.name}")
+            Log.w(TAG, "PPG tracker eroare: ${e.name} — restart în 5s")
+            ppgActive = false
+            ppgTracker?.unsetEventListener()
+            ppgTracker = null
+            handler.postDelayed({
+                if (isRunning) restartPpgTracker()
+            }, 5_000L)
         }
     }
 
@@ -333,7 +390,13 @@ class SensorService : Service(), SensorEventListener {
         }
         override fun onFlushCompleted() {}
         override fun onError(e: HealthTracker.TrackerError) {
-            Log.e(TAG, "ACC SDK tracker eroare: ${e.name}")
+            Log.w(TAG, "ACC SDK tracker eroare: ${e.name} — restart în 5s")
+            accActive = false
+            accSdkTracker?.unsetEventListener()
+            accSdkTracker = null
+            handler.postDelayed({
+                if (isRunning) restartAccTracker()
+            }, 5_000L)
         }
     }
 
@@ -517,6 +580,7 @@ class SensorService : Service(), SensorEventListener {
             if (heartRateTracker != null) {
                 handler.post { heartRateTracker?.setEventListener(heartRateListener) }
                 ibiActive = true
+                lastIbiTimestampMs = System.currentTimeMillis()
                 count++
                 Log.i(TAG, "✓ HR+IBI tracker pornit ($hrType)")
                 break
@@ -576,6 +640,61 @@ class SensorService : Service(), SensorEventListener {
             "MQTT: batch la ${mqttPublishIntervalMs}ms; PPG stream=${if (ppgStreamEnabled) "ON (biofizic/ppg/stream)" else "OFF"}"
         )
         startPublishLoops()
+    }
+
+    private fun restartHrTracker() {
+        val capabilities = samsungCapabilities()
+        for (hrType in listOf(
+            HealthTrackerType.HEART_RATE_CONTINUOUS,
+            HealthTrackerType.HEART_RATE
+        )) {
+            if (hrType !in capabilities) continue
+            val tracker = obtainTracker(hrType) ?: continue
+            heartRateTracker = tracker
+            handler.post { heartRateTracker?.setEventListener(heartRateListener) }
+            ibiActive = true
+            lastIbiTimestampMs = System.currentTimeMillis()
+            Log.i(TAG, "HR tracker restartat ($hrType)")
+            return
+        }
+        Log.e(TAG, "HR tracker restart eșuat — retry în 10s")
+        handler.postDelayed({ if (isRunning) restartHrTracker() }, 10_000L)
+    }
+
+    private fun restartPpgTracker() {
+        val capabilities = samsungCapabilities()
+        for (ppgMode in listOf(
+            HealthTrackerType.PPG_CONTINUOUS,
+            HealthTrackerType.PPG_ON_DEMAND
+        )) {
+            if (ppgMode !in capabilities) continue
+            val tracker = obtainPpgTracker(ppgMode) ?: continue
+            ppgTracker = tracker
+            handler.post { ppgTracker?.setEventListener(ppgListener) }
+            ppgActive = true
+            Log.i(TAG, "PPG tracker restartat ($ppgMode)")
+            return
+        }
+        Log.e(TAG, "PPG tracker restart eșuat — retry în 10s")
+        handler.postDelayed({ if (isRunning) restartPpgTracker() }, 10_000L)
+    }
+
+    private fun restartAccTracker() {
+        val capabilities = samsungCapabilities()
+        if (HealthTrackerType.ACCELEROMETER_CONTINUOUS !in capabilities) {
+            Log.e(TAG, "ACC tracker restart eșuat — tip indisponibil")
+            return
+        }
+        val tracker = obtainTracker(HealthTrackerType.ACCELEROMETER_CONTINUOUS)
+        if (tracker == null) {
+            Log.e(TAG, "ACC tracker restart eșuat — retry în 10s")
+            handler.postDelayed({ if (isRunning) restartAccTracker() }, 10_000L)
+            return
+        }
+        accSdkTracker = tracker
+        handler.post { accSdkTracker?.setEventListener(accSdkListener) }
+        accActive = true
+        Log.i(TAG, "ACC tracker restartat")
     }
 
     private fun shortTypeName(type: Int): String = when (type) {
@@ -641,9 +760,28 @@ class SensorService : Service(), SensorEventListener {
                 keepAliveInterval = 30
                 isAutomaticReconnect = true
             }
+            mqttClient.setCallback(object : MqttCallback {
+                override fun connectionLost(cause: Throwable?) {
+                    isMqttConnected = false
+                    Log.w(TAG, "MQTT pierdut: ${cause?.message}")
+                }
+
+                override fun messageArrived(topic: String?, message: MqttMessage?) {
+                    if (topic != "biofizic/state" || message == null) return
+                    try {
+                        val json = message.payload.decodeToString()
+                        parseStateMessage(json)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "state parse: ${e.message}")
+                    }
+                }
+
+                override fun deliveryComplete(token: IMqttDeliveryToken?) {}
+            })
             mqttClient.connect(options)
+            mqttClient.subscribe("biofizic/state", 0)
             isMqttConnected = true
-            Log.i(TAG, "MQTT conectat la $BROKER_URL")
+            Log.i(TAG, "MQTT conectat la $BROKER_URL (+ subscribe biofizic/state)")
         } catch (e: Exception) {
             isMqttConnected = false
             Log.e(TAG, "MQTT eroare conectare: ${e.message}")
@@ -681,6 +819,10 @@ class SensorService : Service(), SensorEventListener {
                 val skin = dp.getValue(ValueKey.SkinTemperatureSet.OBJECT_TEMPERATURE)
                 val amb = dp.getValue(ValueKey.SkinTemperatureSet.AMBIENT_TEMPERATURE)
                 val status = dp.getValue(ValueKey.SkinTemperatureSet.STATUS)
+                if (status == 0 && skin > 0) {
+                    lastSkinTempC = skin.toDouble()
+                    lastAmbientTempC = amb.toDouble()
+                }
                 skinSamples.add(
                     """{"ts":${dp.timestamp},"skin":$skin,"ambient":$amb,"status":$status}"""
                 )
@@ -707,20 +849,68 @@ class SensorService : Service(), SensorEventListener {
         }
     }
 
+    private fun trimIbiWindow() {
+        val cutoff = System.currentTimeMillis() - IBI_RETENTION_MS
+        while (ibiWindow.isNotEmpty() && ibiWindow.first().ts < cutoff) {
+            ibiWindow.removeFirst()
+        }
+        while (ibiWindow.size > MAX_IBI_ENTRIES) {
+            ibiWindow.removeFirst()
+        }
+    }
+
+    /** Toate IBI din buffer (până la 90s) — evită fereastră 12s când bătăile sunt rare în ultimul minut. */
+    private fun ibiMsForHrvWindow(): List<Int> = ibiWindow.map { it.ibiMs }
+
     private fun publishHrvFeatures() {
         val ibiSnapshot: List<Int>
         val accRms: Double
         synchronized(bufferLock) {
-            ibiSnapshot = ibiWindowMs.toList()
+            trimIbiWindow()
+            ibiSnapshot = ibiMsForHrvWindow()
             accRms = if (accMagnitudes.isEmpty()) 0.0
             else sqrt(accMagnitudes.map { it * it }.average())
         }
-        val features = HrvFeatureCalculator.compute(ibiSnapshot) ?: return
-        lastRmssd = features.rmssd
         val ts = System.currentTimeMillis()
+        val secSinceIbi = if (lastIbiTimestampMs > 0) (ts - lastIbiTimestampMs) / 1000.0 else -1.0
+        val features = HrvFeatureCalculator.compute(ibiSnapshot)
+        val ibiN: Int
+        val windowSec: Double
+        val rmssd: Double
+        val sdnn: Double
+        val meanIbi: Double
+        val meanHr: Double
+        val pnn50: Double
+        if (features != null) {
+            lastRmssd = features.rmssd
+            lastWindowSec = features.windowSec
+            ibiN = features.ibiCount
+            windowSec = features.windowSec
+            rmssd = features.rmssd
+            sdnn = features.sdnn
+            meanIbi = features.meanIbiMs
+            meanHr = features.meanHrBpm
+            pnn50 = features.pnn50
+        } else {
+            // Mișcare intensă (ex. flotări): fără IBI valid — tot publicăm heartbeat MQTT
+            ibiN = ibiSnapshot.size
+            windowSec = 0.0
+            rmssd = 0.0
+            sdnn = 0.0
+            meanIbi = 0.0
+            meanHr = if (lastHr > 0) lastHr.toDouble() else 0.0
+            pnn50 = 0.0
+        }
+        val localHrvReady = ibiN >= MIN_IBI_FOR_HRV && windowSec >= MIN_WINDOW_SEC_FOR_SIGNAL
+        if (ts - lastStateMessageMs > 4_000L) {
+            signalOk = localHrvReady
+        }
+        val hrvJson =
+            """{"ts":$ts,"ibi_n":$ibiN,"window_sec":${jsonFloat(windowSec, 1)},"hrv_ready":$localHrvReady,"rmssd":${jsonFloat(rmssd, 2)},"sdnn":${jsonFloat(sdnn, 2)},"mean_ibi":${jsonFloat(meanIbi, 1)},"mean_hr":${jsonFloat(meanHr, 1)},"pnn50":${jsonFloat(pnn50, 1)}}"""
+        publish("biofizic/hrv", hrvJson)
         publish(
             "biofizic/features",
-            """{"ts":$ts,"displayOn":$displayOn,"bgSensors":$backgroundSensorsGranted,"hr":$lastHr,"ibi_n":${features.ibiCount},"rmssd":${jsonFloat(features.rmssd, 2)},"sdnn":${jsonFloat(features.sdnn, 2)},"mean_ibi":${jsonFloat(features.meanIbiMs, 1)},"mean_hr":${jsonFloat(features.meanHrBpm, 1)},"pnn50":${jsonFloat(features.pnn50, 1)},"acc_rms":${jsonFloat(accRms, 3)}}"""
+            """{"ts":$ts,"displayOn":$displayOn,"bgSensors":$backgroundSensorsGranted,"hr":$lastHr,"ibi_n":$ibiN,"window_sec":${jsonFloat(windowSec, 1)},"sec_since_last_ibi":${jsonFloat(secSinceIbi, 1)},"ibi_buffer":${ibiWindow.size},"hrv_ready":$localHrvReady,"rmssd":${jsonFloat(rmssd, 2)},"sdnn":${jsonFloat(sdnn, 2)},"mean_ibi":${jsonFloat(meanIbi, 1)},"mean_hr":${jsonFloat(meanHr, 1)},"pnn50":${jsonFloat(pnn50, 1)},"acc_rms":${jsonFloat(accRms, 3)},"skin_temp":${jsonFloat(lastSkinTempC, 2)},"ambient_temp":${jsonFloat(lastAmbientTempC, 2)}}"""
         )
     }
 
@@ -743,6 +933,42 @@ class SensorService : Service(), SensorEventListener {
         if (buffer.isEmpty()) return
         publish(topic, """{"n":${buffer.size},"samples":[${buffer.joinToString(",")}]}""")
         buffer.clear()
+    }
+
+    private fun parseStateMessage(json: String) {
+        val a10 = extractJsonInt(json, "arousal_10") ?: return
+        lastStateMessageMs = System.currentTimeMillis()
+        arousal10 = a10.coerceIn(0, 10)
+        arousalConfidence = extractJsonFloat(json, "confidence") ?: 0f
+        emotionLabel = extractJsonString(json, "emotion") ?: "—"
+        extractJsonBool(json, "motion_gated")?.let { motionGated = it }
+        extractJsonBool(json, "profile_ready")?.let { profileReady = it }
+        extractJsonBool(json, "signal_ok")?.let { signalOk = it }
+        extractJsonFloat(json, "window_sec")?.let { lastWindowSec = it.toDouble() }
+    }
+
+    private fun extractJsonBool(json: String, key: String): Boolean? {
+        val re = Regex("\"$key\"\\s*:\\s*(true|false)", RegexOption.IGNORE_CASE)
+        return when (re.find(json)?.groupValues?.get(1)?.lowercase()) {
+            "true" -> true
+            "false" -> false
+            else -> null
+        }
+    }
+
+    private fun extractJsonInt(json: String, key: String): Int? {
+        val re = Regex("\"$key\"\\s*:\\s*(-?\\d+)")
+        return re.find(json)?.groupValues?.get(1)?.toIntOrNull()
+    }
+
+    private fun extractJsonFloat(json: String, key: String): Float? {
+        val re = Regex("\"$key\"\\s*:\\s*([\\d.]+)")
+        return re.find(json)?.groupValues?.get(1)?.toFloatOrNull()
+    }
+
+    private fun extractJsonString(json: String, key: String): String? {
+        val re = Regex("\"$key\"\\s*:\\s*\"([^\"]+)\"")
+        return re.find(json)?.groupValues?.get(1)
     }
 
     private fun publish(topic: String, payload: String) {
@@ -784,6 +1010,19 @@ class SensorService : Service(), SensorEventListener {
                         Log.e(TAG, "Samsung SDK retry eroare: ${e.message}")
                     }
                 }
+
+                if (lastIbiTimestampMs > 0 && isRunning) {
+                    val ibiStaleSec = (System.currentTimeMillis() - lastIbiTimestampMs) / 1000
+                    if (ibiStaleSec > 45L && heartRateTracker != null) {
+                        Log.w(TAG, "HR tracker inactiv de ${ibiStaleSec}s — restart forțat")
+                        handler.post {
+                            heartRateTracker?.unsetEventListener()
+                            heartRateTracker = null
+                            ibiActive = false
+                            restartHrTracker()
+                        }
+                    }
+                }
             } catch (_: InterruptedException) {
                 break
             } catch (e: Exception) {
@@ -804,6 +1043,14 @@ class SensorService : Service(), SensorEventListener {
 
     private fun stopAllTracking() {
         isRunning = false
+        arousal10 = -1
+        arousalConfidence = 0f
+        emotionLabel = "—"
+        motionGated = false
+        profileReady = false
+        signalOk = false
+        lastWindowSec = 0.0
+        lastStateMessageMs = 0L
         stopPublishLoops()
         publishHrvFeatures()
         flushAllMqttBuffers()
@@ -815,7 +1062,8 @@ class SensorService : Service(), SensorEventListener {
             hrSamples.clear()
             ibiSamples.clear()
             gyroSamples.clear()
-            ibiWindowMs.clear()
+            ibiWindow.clear()
+            lastIbiTimestampMs = 0L
             accMagnitudes.clear()
             lastStepJson = null
         }

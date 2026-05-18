@@ -3,7 +3,8 @@ package com.doltu.biofizic.presentation
 import kotlin.math.sqrt
 
 /**
- * Feature-uri HRV din intervale IBI (ms) – potrivite pentru arousal / stress / emoții.
+ * Feature-uri HRV din intervale IBI (ms).
+ * [windowSec] = sumă IBI valide / 1000 → durată cardiacă acoperită de fereastră.
  */
 object HrvFeatureCalculator {
 
@@ -14,9 +15,9 @@ object HrvFeatureCalculator {
         val meanHrBpm: Double,
         val pnn50: Double,
         val ibiCount: Int,
+        val windowSec: Double,
     )
 
-    /** IBI plauzibil: ~30–200 BPM */
     private const val MIN_IBI_MS = 300
     private const val MAX_IBI_MS = 2_000
 
@@ -36,6 +37,7 @@ object HrvFeatureCalculator {
         else 100.0 * successiveDiffs.count { kotlin.math.abs(it) > 50 } / successiveDiffs.size
 
         val meanHr = if (mean > 0) 60_000.0 / mean else 0.0
+        val windowSec = valid.sum() / 1000.0
 
         return Features(
             rmssd = rmssd,
@@ -44,6 +46,7 @@ object HrvFeatureCalculator {
             meanHrBpm = meanHr,
             pnn50 = pnn50,
             ibiCount = valid.size,
+            windowSec = windowSec,
         )
     }
 }
