@@ -12,6 +12,8 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.*
 import android.util.Log
+import org.json.JSONException
+import org.json.JSONObject
 import com.samsung.android.service.health.tracking.ConnectionListener
 import com.samsung.android.service.health.tracking.HealthTracker
 import com.samsung.android.service.health.tracking.HealthTrackerException
@@ -117,9 +119,11 @@ class SensorService : Service(), SensorEventListener {
         private const val MIN_IBI_FOR_HRV = 12
         private const val MIN_WINDOW_SEC_FOR_SIGNAL = 10.0
         private const val MAX_ACC_MAGNITUDES = 64
+        private const val WAKE_LOCK_TIMEOUT_MS = 4 * 60 * 60 * 1000L
     }
 
     private var scanOnlyMode = false
+    private var accScaleLogRemaining = 5
     private var screenReceiverRegistered = false
     private var displayOnLocal = true
     private val ibiWindow = ArrayDeque<IbiWindowEntry>(220)
@@ -407,9 +411,7 @@ class SensorService : Service(), SensorEventListener {
         super.onCreate()
         Log.i(TAG, "Service onCreate")
 
-        val pm = getSystemService(POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "biofizic:SensorWakeLock")
-        wakeLock.acquire()
+        acquireWakeLock()
 
         startForeground(1, buildNotification())
         sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
@@ -424,11 +426,7 @@ class SensorService : Service(), SensorEventListener {
             }
             ACTION_SCAN -> {
                 Log.i(TAG, "ACTION_SCAN – inventar senzori")
-                if (!::wakeLock.isInitialized) {
-                    val pm = getSystemService(POWER_SERVICE) as PowerManager
-                    wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "biofizic:SensorWakeLock")
-                    wakeLock.acquire()
-                }
+                acquireWakeLock()
                 startForeground(2, buildNotification("Scanare senzori…"))
                 scanOnlyMode = true
                 sdkScanDone = false
@@ -836,10 +834,21 @@ class SensorService : Service(), SensorEventListener {
                 val x = dp.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_X)
                 val y = dp.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_Y)
                 val z = dp.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_Z)
-                accSamples.add("""{"ts":${dp.timestamp},"ax":$x,"ay":$y,"az":$z}""")
-                val xf = x.toDouble()
-                val yf = y.toDouble()
-                val zf = z.toDouble()
+                // Samsung LSM6DSV ±8g range, 16-bit; de verificat cu logcat la repaus:
+                // az_mps2 ar trebui ≈9.81, dacă nu ajustează scala (4096).
+                val xf = x.toDouble() / 4096.0 * 9.81
+                val yf = y.toDouble() / 4096.0 * 9.81
+                val zf = z.toDouble() / 4096.0 * 9.81
+                if (accScaleLogRemaining > 0) {
+                    Log.i(
+                        TAG,
+                        "ACC m/s² sample: ax=${jsonFloat(xf, 3)} ay=${jsonFloat(yf, 3)} az=${jsonFloat(zf, 3)} (raw x=$x y=$y z=$z)"
+                    )
+                    accScaleLogRemaining--
+                }
+                accSamples.add(
+                    """{"ts":${dp.timestamp},"ax":${jsonFloat(xf, 4)},"ay":${jsonFloat(yf, 4)},"az":${jsonFloat(zf, 4)}}"""
+                )
                 val mag = sqrt(xf * xf + yf * yf + zf * zf)
                 accMagnitudes.add(mag)
                 while (accMagnitudes.size > MAX_ACC_MAGNITUDES) {
@@ -859,15 +868,12 @@ class SensorService : Service(), SensorEventListener {
         }
     }
 
-    /** Toate IBI din buffer (până la 90s) — evită fereastră 12s când bătăile sunt rare în ultimul minut. */
-    private fun ibiMsForHrvWindow(): List<Int> = ibiWindow.map { it.ibiMs }
-
     private fun publishHrvFeatures() {
-        val ibiSnapshot: List<Int>
+        val ibiSnapshot: List<IbiWindowEntry>
         val accRms: Double
         synchronized(bufferLock) {
             trimIbiWindow()
-            ibiSnapshot = ibiMsForHrvWindow()
+            ibiSnapshot = ibiWindow.toList()
             accRms = if (accMagnitudes.isEmpty()) 0.0
             else sqrt(accMagnitudes.map { it * it }.average())
         }
@@ -936,39 +942,34 @@ class SensorService : Service(), SensorEventListener {
     }
 
     private fun parseStateMessage(json: String) {
-        val a10 = extractJsonInt(json, "arousal_10") ?: return
-        lastStateMessageMs = System.currentTimeMillis()
-        arousal10 = a10.coerceIn(0, 10)
-        arousalConfidence = extractJsonFloat(json, "confidence") ?: 0f
-        emotionLabel = extractJsonString(json, "emotion") ?: "—"
-        extractJsonBool(json, "motion_gated")?.let { motionGated = it }
-        extractJsonBool(json, "profile_ready")?.let { profileReady = it }
-        extractJsonBool(json, "signal_ok")?.let { signalOk = it }
-        extractJsonFloat(json, "window_sec")?.let { lastWindowSec = it.toDouble() }
-    }
-
-    private fun extractJsonBool(json: String, key: String): Boolean? {
-        val re = Regex("\"$key\"\\s*:\\s*(true|false)", RegexOption.IGNORE_CASE)
-        return when (re.find(json)?.groupValues?.get(1)?.lowercase()) {
-            "true" -> true
-            "false" -> false
-            else -> null
+        try {
+            val obj = JSONObject(json)
+            if (!obj.has("arousal_10")) return
+            val a10 = obj.optInt("arousal_10", -1)
+            if (a10 < 0) return
+            lastStateMessageMs = System.currentTimeMillis()
+            arousal10 = a10.coerceIn(0, 10)
+            arousalConfidence = obj.optDouble("confidence", 0.0).toFloat()
+            val emotion = obj.optString("emotion", "")
+            emotionLabel = emotion.ifEmpty { "—" }
+            if (obj.has("motion_gated")) motionGated = obj.optBoolean("motion_gated")
+            if (obj.has("profile_ready")) profileReady = obj.optBoolean("profile_ready")
+            if (obj.has("signal_ok")) signalOk = obj.optBoolean("signal_ok")
+            if (obj.has("window_sec")) lastWindowSec = obj.optDouble("window_sec")
+        } catch (e: JSONException) {
+            Log.w(TAG, "parseStateMessage: ${e.message}")
         }
     }
 
-    private fun extractJsonInt(json: String, key: String): Int? {
-        val re = Regex("\"$key\"\\s*:\\s*(-?\\d+)")
-        return re.find(json)?.groupValues?.get(1)?.toIntOrNull()
-    }
-
-    private fun extractJsonFloat(json: String, key: String): Float? {
-        val re = Regex("\"$key\"\\s*:\\s*([\\d.]+)")
-        return re.find(json)?.groupValues?.get(1)?.toFloatOrNull()
-    }
-
-    private fun extractJsonString(json: String, key: String): String? {
-        val re = Regex("\"$key\"\\s*:\\s*\"([^\"]+)\"")
-        return re.find(json)?.groupValues?.get(1)
+    private fun acquireWakeLock() {
+        if (!::wakeLock.isInitialized) {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "biofizic:SensorWakeLock")
+                .apply { setReferenceCounted(false) }
+        }
+        if (!wakeLock.isHeld) {
+            wakeLock.acquire(WAKE_LOCK_TIMEOUT_MS)
+        }
     }
 
     private fun publish(topic: String, payload: String) {
@@ -992,6 +993,10 @@ class SensorService : Service(), SensorEventListener {
         while (isRunning) {
             try {
                 Thread.sleep(10_000)
+
+                if (::wakeLock.isInitialized && !wakeLock.isHeld) {
+                    wakeLock.acquire(WAKE_LOCK_TIMEOUT_MS)
+                }
 
                 // Verifica MQTT
                 val connected = ::mqttClient.isInitialized && mqttClient.isConnected
