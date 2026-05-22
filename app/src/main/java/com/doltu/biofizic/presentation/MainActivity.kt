@@ -4,9 +4,11 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.content.Context
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -63,6 +65,8 @@ class MainActivity : ComponentActivity() {
 
     private var foregroundSensorsGranted = false
 
+    private val prefs by lazy { getSharedPreferences("biofizic", Context.MODE_PRIVATE) }
+
     private val backgroundSensorPermLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
@@ -95,13 +99,6 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent { BiofizicWatchApp() }
 
-        val pm = getSystemService(POWER_SERVICE) as PowerManager
-        if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-            startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                data = Uri.parse("package:$packageName")
-            })
-        }
-
         permissionLauncher.launch(
             arrayOf(
                 Manifest.permission.BODY_SENSORS,
@@ -117,12 +114,45 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    override fun onResume() {
+        super.onResume()
+        applyKeepScreenOn()
+    }
+
+    override fun onPause() {
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        super.onPause()
+    }
+
+    internal fun applyKeepScreenOn() {
+        if (SensorService.isRunning && SensorService.keepScreenAwake) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    private fun maybeRequestBatteryExemption() {
+        if (prefs.getBoolean("asked_battery_opt", false)) return
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) {
+            prefs.edit().putBoolean("asked_battery_opt", true).apply()
+            return
+        }
+        prefs.edit().putBoolean("asked_battery_opt", true).apply()
+        startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+            data = Uri.parse("package:$packageName")
+        })
+    }
+
     private fun startTracking() {
+        maybeRequestBatteryExemption()
         startForegroundService(
             Intent(this, SensorService::class.java).apply {
                 action = SensorService.ACTION_START
             }
         )
+        applyKeepScreenOn()
     }
 
     private fun requestBackgroundSensorPermission() {
@@ -172,6 +202,9 @@ fun BiofizicWatchApp() {
     LaunchedEffect(Unit) {
         while (true) {
             isRunning = SensorService.isRunning
+            if (isRunning) {
+                (context as? MainActivity)?.applyKeepScreenOn()
+            }
             mqttOk = SensorService.isMqttConnected
             hr = SensorService.lastHr
             arousal10 = SensorService.arousal10
@@ -226,6 +259,13 @@ fun BiofizicWatchApp() {
                     context.startForegroundService(
                         Intent(context, SensorService::class.java).apply { this.action = action },
                     )
+                    if (action == SensorService.ACTION_STOP) {
+                        (context as? MainActivity)?.window?.clearFlags(
+                            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                        )
+                    } else {
+                        (context as? MainActivity)?.applyKeepScreenOn()
+                    }
                 },
                 colors = ButtonDefaults.buttonColors(backgroundColor = btnColor),
                 modifier = Modifier

@@ -32,7 +32,7 @@ object HrvFeatureCalculator {
         val variance = valid.map { (it.ibiMs - mean) * (it.ibiMs - mean) }.average()
         val sdnn = sqrt(variance)
 
-        val successiveDiffs = successiveDiffsWithTemporalCheck(valid)
+        val successiveDiffs = successiveDiffs(valid)
         val rmssd = if (successiveDiffs.isEmpty()) 0.0
         else sqrt(successiveDiffs.map { it * it }.average())
 
@@ -51,6 +51,16 @@ object HrvFeatureCalculator {
             ibiCount = valid.size,
             windowSec = windowSec,
         )
+    }
+
+    /** Preferă perechi cu timestamp coerent; fallback la ΔIBI simplu (rafale GW7 = același ts). */
+    private fun successiveDiffs(valid: List<IbiWindowEntry>): List<Double> {
+        val withTs = successiveDiffsWithTemporalCheck(valid)
+        if (withTs.isNotEmpty()) return withTs
+        if (valid.size < 2) return emptyList()
+        return (0 until valid.size - 1).map { i ->
+            (valid[i + 1].ibiMs - valid[i].ibiMs).toDouble()
+        }
     }
 
     private fun successiveDiffsWithTemporalCheck(valid: List<IbiWindowEntry>): List<Double> {

@@ -1,48 +1,42 @@
 package com.doltu.biofizic.presentation
 
-import kotlin.collections.ArrayDeque
 import kotlin.math.abs
 
 /**
- * Filtrare IBI înainte de HRV: status Samsung, interval fiziologic, outliers față de mediană.
+ * Filtru minim IBI: status Samsung + interval fiziologic (ms).
+ * Fără mediană/outliers — HRV se calculează pe epocă din lista completă.
  */
 object IbiSignalFilter {
 
-    const val MIN_IBI_MS = 300
-    const val MAX_IBI_MS = 2_000
-    private const val MAX_DEVIATION_RATIO = 0.30
+    const val MIN_IBI_MS = 250
+    const val MAX_IBI_MS = 2_500
 
-    /** [ValueKey.EdaSet] / HeartRate: 0 = normal; -1 = eroare. */
-    fun isStatusOk(status: Int?): Boolean = status == null || status == 0
+    /** GW7: bătăi valide des cu st=-1; respingem doar erori (ex. -10). */
+    fun isStatusOk(status: Int?): Boolean =
+        status == null || status == 0 || status == -1
 
     fun isPhysiological(ibiMs: Int): Boolean = ibiMs in MIN_IBI_MS..MAX_IBI_MS
 
-    /**
-     * Respinge bătăi izolate față de mediană (artefact PPG, ex. IBI 522 ms la HR ~96).
-     */
-    fun isConsistentWithWindow(ibiMs: Int, recentIbIs: Collection<Int>): Boolean {
-        if (recentIbIs.size < 3) return true
-        val median = recentIbIs.sorted()[recentIbIs.size / 2]
-        if (median <= 0) return true
-        return abs(ibiMs - median) <= median * MAX_DEVIATION_RATIO
+    /** GW7 poate trimite 62 în loc de 620 ms — scalare ×10 când e plauzibil. */
+    fun normalizeIbiMs(raw: Int, hrBpm: Int): Int {
+        if (raw in MIN_IBI_MS..MAX_IBI_MS) return raw
+        if (raw in 30..250) {
+            val scaled = raw * 10
+            if (scaled in MIN_IBI_MS..MAX_IBI_MS) {
+                if (hrBpm > 0) {
+                    val expected = 60_000 / hrBpm
+                    if (abs(scaled - expected) < abs(raw - expected)) return scaled
+                } else {
+                    return scaled
+                }
+            }
+        }
+        return raw
     }
 
-    fun accept(
-        ibiMs: Int,
-        status: Int?,
-        recentIbIs: Collection<Int>,
-    ): Boolean =
-        isStatusOk(status) &&
-            isPhysiological(ibiMs) &&
-            isConsistentWithWindow(ibiMs, recentIbIs)
-
-    /** Curăță fereastra existentă de outliers. */
-    fun sanitizeWindow(window: ArrayDeque<IbiWindowEntry>) {
-        if (window.size < 4) return
-        val ms = window.map { it.ibiMs }
-        val median = ms.sorted()[ms.size / 2]
-        val keep = window.filter { abs(it.ibiMs - median) <= median * MAX_DEVIATION_RATIO }
-        window.clear()
-        keep.forEach { window.addLast(it) }
+    fun acceptBeat(rawIbiMs: Int, status: Int?, hrBpm: Int): Int? {
+        if (!isStatusOk(status)) return null
+        val norm = normalizeIbiMs(rawIbiMs, hrBpm)
+        return if (isPhysiological(norm)) norm else null
     }
 }

@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -26,6 +27,7 @@ import androidx.core.content.ContextCompat
 import org.eclipse.paho.client.mqttv3.*
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.sqrt
 
 class SensorService : Service(), SensorEventListener {
@@ -66,6 +68,9 @@ class SensorService : Service(), SensorEventListener {
         const val ACTION_SCAN = "com.doltu.biofizic.ACTION_SCAN"
 
         @Volatile var isRunning = false
+        /** Cât timp MainActivity e vizibilă: ține ecranul aprins (evită watch face la ~30s). */
+        /** false = lasă ceasul să stingă ecranul (FGS + senzori continuă). */
+        @Volatile var keepScreenAwake = false
         @Volatile var isMqttConnected = false
         @Volatile var lastHr = 0
         @Volatile var activeSensors = 0
@@ -89,17 +94,31 @@ class SensorService : Service(), SensorEventListener {
          */
         /** Batch PPG/IBI/HR pe MQTT (1 s). */
         @Volatile var mqttPublishIntervalMs = 1_000L
-        /** HRV + features pentru clasificator (500 ms). */
-        @Volatile var hrvPublishIntervalMs = 500L
+        /** Lean: un singur pachet biofizic/epoch la 30s (IBI brut + HRV). */
+        @Volatile var hrvPublishIntervalMs = 30_000L
+
+        /**
+         * true = doar biofizic/features; fără batch ppg/ibi/hr/acc/gyro pe MQTT.
+         */
+        @Volatile var leanMqtt = true
+
+        /** Flush SDK HR → umple ibiWindow (rafale GW7 ~4s). */
+        @Volatile var hrFlushIntervalMs = 4_000L
 
         /** PPG: câte un mesaj MQTT per eșantion pe biofizic/ppg/stream (pentru semnal + jitter). */
         @Volatile var ppgStreamEnabled = false
+
+        /** PPG raw batch publishing pentru pipeline-ul DSP extern. */
+        @Volatile var ppgRawEnabled = true
+
+        /** Câte secunde de PPG acumulezi înainte de flush pe biofizic/ppg/raw. */
+        @Volatile var ppgBatchSec = 2
 
         @Volatile var lastSkinTempC = 0.0
         @Volatile var lastAmbientTempC = 0.0
 
         @Volatile var displayOn = true
-        @Volatile var backgroundSensorsGranted = false
+        @Volatile var backgroundSensorsGranted = true
         @Volatile var lastRmssd = 0.0
 
         /** Din biofizic/state (clasificator v2 pe VPS). */
@@ -113,11 +132,13 @@ class SensorService : Service(), SensorEventListener {
         @Volatile var lastStateMessageMs = 0L
 
         private const val MAX_IBI_ENTRIES = 200
-        private const val IBI_RETENTION_MS = 90_000L
-        /** Fereastră HRV: ultimele 60 s (timp perete). */
-        private const val HRV_WINDOW_MS = 60_000L
-        private const val MIN_IBI_FOR_HRV = 12
-        private const val MIN_WINDOW_SEC_FOR_SIGNAL = 10.0
+        private const val IBI_RETENTION_MS = 120_000L
+        /** Fereastră HRV pe ceas = epoca de clasificare (30 s). */
+        private const val HRV_WINDOW_MS = 30_000L
+        const val EPOCH_SEC = 30
+        @Volatile var strictIbiFilter = false
+        private const val MIN_IBI_FOR_HRV = 8
+        private const val MIN_WINDOW_SEC_FOR_SIGNAL = 6.0
         private const val MAX_ACC_MAGNITUDES = 64
         private const val WAKE_LOCK_TIMEOUT_MS = 4 * 60 * 60 * 1000L
     }
@@ -141,6 +162,10 @@ class SensorService : Service(), SensorEventListener {
 
     private val bufferLock = Any()
     private val ppgSamples = mutableListOf<String>()
+
+    // PPG raw batch pentru pipeline-ul DSP extern
+    private val ppgBatchLock = Any()
+    private val ppgBatch = mutableListOf<Triple<Long, Int, Int>>()  // (ts_ms, green, ir)
     private val skinSamples = mutableListOf<String>()
     private val accSamples = mutableListOf<String>()
     private val hrSamples = mutableListOf<String>()
@@ -149,8 +174,17 @@ class SensorService : Service(), SensorEventListener {
     private var lastStepJson: String? = null
 
     private var sdkFlushLoopRunning = false
+    private var hrFlushLoopRunning = false
     private var hrvPublishLoopRunning = false
     private var mqttPublishLoopRunning = false
+    private var ppgBatchLoopRunning = false
+
+    @Volatile private var lastHrDataMs = 0L
+    @Volatile private var lastHrBatchPoints = 0
+    @Volatile private var lastHrBatchIbi = 0
+    private var lastHrBatchLogMs = 0L
+    private var lastHrPulseLogMs = 0L
+    private var inForeground = false
 
     private val sdkFlushRunnable = object : Runnable {
         override fun run() {
@@ -161,8 +195,21 @@ class SensorService : Service(), SensorEventListener {
             ppgTracker?.flush()
             skinTempTracker?.flush()
             accSdkTracker?.flush()
-            heartRateTracker?.flush()
             handler.postDelayed(this, mqttPublishIntervalMs)
+        }
+    }
+
+    private val hrFlushRunnable = object : Runnable {
+        override fun run() {
+            if (!isRunning) {
+                hrFlushLoopRunning = false
+                return
+            }
+            heartRateTracker?.flush()
+            if (leanMqtt) discardLeanIbiBuffer()
+            logHrBatchIfDue()
+            logHrPulse()
+            handler.postDelayed(this, hrFlushIntervalMs)
         }
     }
 
@@ -172,7 +219,7 @@ class SensorService : Service(), SensorEventListener {
                 hrvPublishLoopRunning = false
                 return
             }
-            publishHrvFeatures()
+            publishEpoch()
             handler.postDelayed(this, hrvPublishIntervalMs)
         }
     }
@@ -192,7 +239,15 @@ class SensorService : Service(), SensorEventListener {
     private fun updateDisplayState(on: Boolean) {
         displayOnLocal = on
         displayOn = on
-        Log.i(TAG, "Ecran ${if (on) "ON" else "OFF"} (măsurare ${if (on) "live" else "batch + flush"})")
+        if (leanMqtt) {
+            hrvPublishIntervalMs = 30_000L
+            mqttPublishIntervalMs = 30_000L
+            hrFlushIntervalMs = if (on) 2_000L else 4_000L
+        }
+        Log.i(
+            TAG,
+            "Ecran ${if (on) "ON" else "OFF"} (epoch=${hrvPublishIntervalMs}ms hrFlush=${hrFlushIntervalMs}ms lean=$leanMqtt)"
+        )
     }
 
     private fun registerScreenReceiver() {
@@ -238,13 +293,21 @@ class SensorService : Service(), SensorEventListener {
 
     private fun logPeriodicStatus() {
         val now = System.currentTimeMillis()
-        if (now - lastStatusLogMs < 30_000L) return
+        if (now - lastStatusLogMs < 15_000L) return
         lastStatusLogMs = now
+        backgroundSensorsGranted = ContextCompat.checkSelfPermission(
+            this, android.Manifest.permission.BODY_SENSORS_BACKGROUND
+        ) == PackageManager.PERMISSION_GRANTED
         synchronized(bufferLock) {
+            val liveHrv = HrvFeatureCalculator.compute(ibiWindow.toList())
+            val liveRmssd = liveHrv?.rmssd ?: 0.0
+            val liveWin = liveHrv?.windowSec ?: 0.0
+            val liveOk = ibiWindow.size >= MIN_IBI_FOR_HRV && liveWin >= MIN_WINDOW_SEC_FOR_SIGNAL
             Log.i(
                 TAG,
                 "Status: ecran=${if (displayOn) "ON" else "OFF"}, bg=$backgroundSensorsGranted, " +
-                    "ibiWindow=${ibiWindow.size}, windowSec=${"%.0f".format(lastWindowSec)}, signalOk=$signalOk, rmssd=${"%.1f".format(lastRmssd)}, mqtt=$msgCount"
+                    "ibiWindow=${ibiWindow.size}, windowSec=${"%.0f".format(liveWin)}, " +
+                    "signalOk=$liveOk, rmssd=${"%.1f".format(liveRmssd)}, mqtt=$msgCount"
             )
         }
     }
@@ -254,23 +317,36 @@ class SensorService : Service(), SensorEventListener {
             sdkFlushLoopRunning = true
             handler.post(sdkFlushRunnable)
         }
+        if (!hrFlushLoopRunning) {
+            hrFlushLoopRunning = true
+            handler.post(hrFlushRunnable)
+        }
         if (!hrvPublishLoopRunning) {
             hrvPublishLoopRunning = true
-            handler.post(hrvPublishRunnable)
+            // Prima epocă după 30s (fereastra HRV plină), nu la pornire goală
+            handler.postDelayed(hrvPublishRunnable, hrvPublishIntervalMs)
         }
         if (!mqttPublishLoopRunning) {
             mqttPublishLoopRunning = true
             handler.post(mqttPublishRunnable)
         }
+        if (ppgRawEnabled && !ppgBatchLoopRunning) {
+            ppgBatchLoopRunning = true
+            handler.postDelayed(ppgBatchRunnable, ppgBatchSec * 1000L)
+        }
     }
 
     private fun stopPublishLoops() {
         sdkFlushLoopRunning = false
+        hrFlushLoopRunning = false
         hrvPublishLoopRunning = false
         mqttPublishLoopRunning = false
+        ppgBatchLoopRunning = false
         handler.removeCallbacks(sdkFlushRunnable)
+        handler.removeCallbacks(hrFlushRunnable)
         handler.removeCallbacks(hrvPublishRunnable)
         handler.removeCallbacks(mqttPublishRunnable)
+        handler.removeCallbacks(ppgBatchRunnable)
     }
 
     // ══════════════════════════════════════════
@@ -309,6 +385,10 @@ class SensorService : Service(), SensorEventListener {
     /** HR + IBI */
     private val heartRateListener = object : HealthTracker.TrackerEventListener {
         override fun onDataReceived(dataPoints: List<DataPoint>) {
+            val recvMs = System.currentTimeMillis()
+            val gapMs = if (lastHrDataMs > 0L) recvMs - lastHrDataMs else 0L
+            lastHrDataMs = recvMs
+            var batchIbi = 0
             for (dp in dataPoints) {
                 val hr = dp.getValue(ValueKey.HeartRateSet.HEART_RATE)
                 val status = dp.getValue(ValueKey.HeartRateSet.HEART_RATE_STATUS)
@@ -321,32 +401,50 @@ class SensorService : Service(), SensorEventListener {
                     )
                 }
 
-                if (status != 1) continue
-
                 val ibiList = dp.getValue(ValueKey.HeartRateSet.IBI_LIST)
                 val ibiStatusList = dp.getValue(ValueKey.HeartRateSet.IBI_STATUS_LIST)
-                if (ibiList != null) {
+                if (ibiList != null && status == 1) {
                     synchronized(bufferLock) {
+                        val hrForNorm = if (hr > 0) hr else lastHr
+                        // Filtrare
+                        val accepted = mutableListOf<Int>()
                         for (i in ibiList.indices) {
-                            val ibi = ibiList[i]
-                            val ibiStatus = ibiStatusList?.getOrNull(i)
-                            val recent = ibiWindow.map { it.ibiMs }
-                            if (!IbiSignalFilter.accept(ibi, ibiStatus, recent)) continue
-                            val ts = dp.timestamp.takeIf { it > 0 } ?: System.currentTimeMillis()
-                            ibiWindow.addLast(IbiWindowEntry(ibi, ts))
-                            lastIbiTimestampMs = System.currentTimeMillis()
-                            trimIbiWindow()
-                            enqueueSample(
-                                ibiSamples,
-                                """{"ts":${dp.timestamp},"ibi":$ibi,"st":${ibiStatus ?: 0}}"""
-                            )
+                            val norm = IbiSignalFilter.acceptBeat(
+                                ibiList[i],
+                                ibiStatusList?.getOrNull(i),
+                                hrForNorm,
+                            ) ?: continue
+                            accepted.add(norm)
                         }
-                        IbiSignalFilter.sanitizeWindow(ibiWindow)
+                        if (accepted.isNotEmpty()) {
+                            // Reconstituie timestamps: ultima bătaie s-a terminat acum,
+                            // fiecare bătaie anterioară cu IBI ms mai devreme.
+                            val nowMs = System.currentTimeMillis()
+                            val timestamps = LongArray(accepted.size)
+                            var endTs = nowMs
+                            for (i in accepted.indices.reversed()) {
+                                timestamps[i] = endTs
+                                endTs -= accepted[i]
+                            }
+                            for (i in accepted.indices) {
+                                ibiWindow.addLast(IbiWindowEntry(accepted[i], timestamps[i]))
+                                batchIbi++
+                            }
+                            lastIbiTimestampMs = nowMs
+                            trimIbiWindow()
+                        }
                     }
                 }
             }
+            lastHrBatchPoints = dataPoints.size
+            lastHrBatchIbi = batchIbi
+            if (gapMs >= 3_000L || batchIbi > 0) {
+                logHrBatch(gapMs, dataPoints.size, batchIbi)
+            }
         }
-        override fun onFlushCompleted() {}
+        override fun onFlushCompleted() {
+            logHrBatchIfDue(force = true)
+        }
         override fun onError(e: HealthTracker.TrackerError) {
             Log.w(TAG, "HR tracker eroare: ${e.name} — restart în 3s")
             ibiActive = false
@@ -409,12 +507,48 @@ class SensorService : Service(), SensorEventListener {
     // ══════════════════════════════════════════
     override fun onCreate() {
         super.onCreate()
-        Log.i(TAG, "Service onCreate")
-
+        Log.i(TAG, "Service onCreate (fără startForeground — doar din ACTION_START)")
         acquireWakeLock()
-
-        startForeground(1, buildNotification())
         sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
+    }
+
+    /**
+     * Android 12+: startForeground() din onCreate / boot / alarm crapă cu
+     * ForegroundServiceStartNotAllowedException. Apelăm doar din onStartCommand
+     * după startForegroundService() din MainActivity.
+     */
+    private fun promoteToForeground(notificationId: Int, contentText: String): Boolean {
+        if (inForeground) return true
+        return try {
+            val notification = buildNotification(contentText)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(
+                    notificationId,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH
+                )
+            } else {
+                startForeground(notificationId, notification)
+            }
+            inForeground = true
+            Log.i(TAG, "Foreground service activ")
+            true
+        } catch (e: Exception) {
+            Log.e(
+                TAG,
+                "startForeground respins (${e.javaClass.simpleName}): ${e.message} — " +
+                    "deschide app și apasă Start"
+            )
+            false
+        }
+    }
+
+    private fun leaveForeground() {
+        if (!inForeground) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        }
+        inForeground = false
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -425,9 +559,12 @@ class SensorService : Service(), SensorEventListener {
                 return START_NOT_STICKY
             }
             ACTION_SCAN -> {
+                if (!promoteToForeground(2, "Scanare senzori…")) {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
                 Log.i(TAG, "ACTION_SCAN – inventar senzori")
                 acquireWakeLock()
-                startForeground(2, buildNotification("Scanare senzori…"))
                 scanOnlyMode = true
                 sdkScanDone = false
                 sensorReport = "Scanare în curs…"
@@ -452,10 +589,26 @@ class SensorService : Service(), SensorEventListener {
                 }.start()
                 return START_NOT_STICKY
             }
-            else -> {
-                // ACTION_START sau restart automat
+            ACTION_START -> {
+                if (!promoteToForeground(1, "HR · PPG · ACC · Gyro · Temp")) {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
                 if (!isRunning) {
-                    Log.i(TAG, "Pornire tracking")
+                    Log.i(TAG, "Pornire tracking (ACTION_START)")
+                    isRunning = true
+                    startAllTracking()
+                }
+            }
+            else -> {
+                // Restart automat START_STICKY (intent null) sau boot — reia tracking-ul
+                Log.i(TAG, "onStartCommand restart (action=${intent?.action}) — reia tracking")
+                if (!promoteToForeground(1, "HR · PPG · ACC · Gyro · Temp")) {
+                    Log.w(TAG, "Restart: startForeground eșuat — oprire")
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+                if (!isRunning) {
                     isRunning = true
                     startAllTracking()
                 }
@@ -746,22 +899,30 @@ class SensorService : Service(), SensorEventListener {
     // ══════════════════════════════════════════
     //  MQTT
     // ══════════════════════════════════════════
+    @Volatile private var mqttConnecting = false
+
     private fun connectMqtt() {
+        if (mqttConnecting) return
+        mqttConnecting = true
         try {
             if (::mqttClient.isInitialized) {
+                try {
+                    mqttClient.disconnect(0)
+                } catch (_: Exception) {}
                 try { mqttClient.close() } catch (_: Exception) {}
             }
             mqttClient = MqttClient(BROKER_URL, CLIENT_ID, MemoryPersistence())
             val options = MqttConnectOptions().apply {
                 isCleanSession = true
-                connectionTimeout = 5
-                keepAliveInterval = 30
-                isAutomaticReconnect = true
+                connectionTimeout = 8
+                keepAliveInterval = 45
+                isAutomaticReconnect = false  // watchdog-ul gestionează reconectarea
             }
             mqttClient.setCallback(object : MqttCallback {
                 override fun connectionLost(cause: Throwable?) {
                     isMqttConnected = false
                     Log.w(TAG, "MQTT pierdut: ${cause?.message}")
+                    // Nu reconectăm direct — watchdog-ul va detecta și va apela connectMqtt()
                 }
 
                 override fun messageArrived(topic: String?, message: MqttMessage?) {
@@ -783,6 +944,8 @@ class SensorService : Service(), SensorEventListener {
         } catch (e: Exception) {
             isMqttConnected = false
             Log.e(TAG, "MQTT eroare conectare: ${e.message}")
+        } finally {
+            mqttConnecting = false
         }
     }
 
@@ -806,9 +969,42 @@ class SensorService : Service(), SensorEventListener {
                 }
             }
         }
+        // Acumulare batch PPG raw cu timestamps (pentru pipeline DSP extern)
+        if (ppgRawEnabled) {
+            synchronized(ppgBatchLock) {
+                for (dp in dataPoints) {
+                    val g = dp.getValue(ValueKey.PpgSet.PPG_GREEN)
+                    val ir = dp.getValue(ValueKey.PpgSet.PPG_IR)
+                    ppgBatch.add(Triple(dp.timestamp, g, ir))
+                }
+            }
+        }
         for (payload in streamPayloads) {
             publish("biofizic/ppg/stream", payload)
         }
+    }
+
+    private val ppgBatchRunnable = object : Runnable {
+        override fun run() {
+            if (!isRunning) return
+            flushPpgBatch()
+            handler.postDelayed(this, ppgBatchSec * 1000L)
+        }
+    }
+
+    private fun flushPpgBatch() {
+        if (!ppgRawEnabled) return
+        val snapshot: List<Triple<Long, Int, Int>>
+        synchronized(ppgBatchLock) {
+            if (ppgBatch.isEmpty()) return
+            snapshot = ppgBatch.toList()
+            ppgBatch.clear()
+        }
+        val tsArr  = snapshot.joinToString(",") { it.first.toString() }
+        val gArr   = snapshot.joinToString(",") { it.second.toString() }
+        val irArr  = snapshot.joinToString(",") { it.third.toString() }
+        val payload = """{"ts_start":${snapshot.first().first},"fs":25,"n":${snapshot.size},"ts":[$tsArr],"green":[$gArr],"ir":[$irArr]}"""
+        publish("biofizic/ppg/raw", payload)
     }
 
     private fun enqueueSkinTemp(dataPoints: List<DataPoint>) {
@@ -868,18 +1064,23 @@ class SensorService : Service(), SensorEventListener {
         }
     }
 
-    private fun publishHrvFeatures() {
+    /** Un mesaj / 30s: IBI din fereastră + HRV calculat o dată (sursă unică pentru clasificator). */
+    private fun publishEpoch() {
         val ibiSnapshot: List<IbiWindowEntry>
         val accRms: Double
         synchronized(bufferLock) {
             trimIbiWindow()
             ibiSnapshot = ibiWindow.toList()
             accRms = if (accMagnitudes.isEmpty()) 0.0
-            else sqrt(accMagnitudes.map { it * it }.average())
+            else {
+                val dyn = accMagnitudes.map { abs(it - 9.81) }
+                sqrt(dyn.map { it * it }.average())
+            }
         }
         val ts = System.currentTimeMillis()
         val secSinceIbi = if (lastIbiTimestampMs > 0) (ts - lastIbiTimestampMs) / 1000.0 else -1.0
         val features = HrvFeatureCalculator.compute(ibiSnapshot)
+        val ibiMsJson = ibiSnapshot.joinToString(",") { it.ibiMs.toString() }
         val ibiN: Int
         val windowSec: Double
         val rmssd: Double
@@ -898,7 +1099,6 @@ class SensorService : Service(), SensorEventListener {
             meanHr = features.meanHrBpm
             pnn50 = features.pnn50
         } else {
-            // Mișcare intensă (ex. flotări): fără IBI valid — tot publicăm heartbeat MQTT
             ibiN = ibiSnapshot.size
             windowSec = 0.0
             rmssd = 0.0
@@ -907,20 +1107,85 @@ class SensorService : Service(), SensorEventListener {
             meanHr = if (lastHr > 0) lastHr.toDouble() else 0.0
             pnn50 = 0.0
         }
-        val localHrvReady = ibiN >= MIN_IBI_FOR_HRV && windowSec >= MIN_WINDOW_SEC_FOR_SIGNAL
-        if (ts - lastStateMessageMs > 4_000L) {
-            signalOk = localHrvReady
+        val hrvReady = ibiN >= MIN_IBI_FOR_HRV && windowSec >= MIN_WINDOW_SEC_FOR_SIGNAL
+        signalOk = hrvReady
+        if (!hrvReady) {
+            Log.i(
+                TAG,
+                "Epoch skip MQTT: ibi_n=$ibiN win=${"%.0f".format(windowSec)}s rmssd=${"%.1f".format(rmssd)} " +
+                    "buf=${ibiWindow.size} (min ${MIN_IBI_FOR_HRV} ibi, ${MIN_WINDOW_SEC_FOR_SIGNAL.toInt()}s)"
+            )
+            return
         }
-        val hrvJson =
-            """{"ts":$ts,"ibi_n":$ibiN,"window_sec":${jsonFloat(windowSec, 1)},"hrv_ready":$localHrvReady,"rmssd":${jsonFloat(rmssd, 2)},"sdnn":${jsonFloat(sdnn, 2)},"mean_ibi":${jsonFloat(meanIbi, 1)},"mean_hr":${jsonFloat(meanHr, 1)},"pnn50":${jsonFloat(pnn50, 1)}}"""
-        publish("biofizic/hrv", hrvJson)
+        val payload =
+            """{"ts":$ts,"epoch_sec":$EPOCH_SEC,"displayOn":$displayOn,"bgSensors":$backgroundSensorsGranted,"hr":$lastHr,"ibi_n":$ibiN,"ibi_ms":[$ibiMsJson],"window_sec":${jsonFloat(windowSec, 1)},"sec_since_last_ibi":${jsonFloat(secSinceIbi, 1)},"hrv_ready":$hrvReady,"rmssd":${jsonFloat(rmssd, 2)},"sdnn":${jsonFloat(sdnn, 2)},"mean_ibi":${jsonFloat(meanIbi, 1)},"mean_hr":${jsonFloat(meanHr, 1)},"pnn50":${jsonFloat(pnn50, 1)},"acc_rms":${jsonFloat(accRms, 3)},"skin_temp":${jsonFloat(lastSkinTempC, 2)},"ambient_temp":${jsonFloat(lastAmbientTempC, 2)}}"""
+        publish("biofizic/epoch", payload)
+        publish("biofizic/features", payload)
         publish(
-            "biofizic/features",
-            """{"ts":$ts,"displayOn":$displayOn,"bgSensors":$backgroundSensorsGranted,"hr":$lastHr,"ibi_n":$ibiN,"window_sec":${jsonFloat(windowSec, 1)},"sec_since_last_ibi":${jsonFloat(secSinceIbi, 1)},"ibi_buffer":${ibiWindow.size},"hrv_ready":$localHrvReady,"rmssd":${jsonFloat(rmssd, 2)},"sdnn":${jsonFloat(sdnn, 2)},"mean_ibi":${jsonFloat(meanIbi, 1)},"mean_hr":${jsonFloat(meanHr, 1)},"pnn50":${jsonFloat(pnn50, 1)},"acc_rms":${jsonFloat(accRms, 3)},"skin_temp":${jsonFloat(lastSkinTempC, 2)},"ambient_temp":${jsonFloat(lastAmbientTempC, 2)}}"""
+            "biofizic/hrv",
+            """{"ts":$ts,"ibi_n":$ibiN,"window_sec":${jsonFloat(windowSec, 1)},"hrv_ready":$hrvReady,"rmssd":${jsonFloat(rmssd, 2)},"mean_hr":${jsonFloat(meanHr, 1)}}"""
+        )
+        Log.i(
+            TAG,
+            "Epoch MQTT: ibi_n=$ibiN win=${"%.0f".format(windowSec)}s rmssd=${"%.1f".format(rmssd)} hr=$lastHr scr=${if (displayOn) "ON" else "OFF"}"
         )
     }
 
+    private fun logHrBatch(gapMs: Long, points: Int, ibiCount: Int) {
+        val now = System.currentTimeMillis()
+        if (now - lastHrBatchLogMs < 2_000L) return
+        lastHrBatchLogMs = now
+        Log.i(
+            TAG,
+            "HR batch: gapMs=$gapMs points=$points ibi=$ibiCount buf=${ibiWindow.size} scr=${if (displayOn) "ON" else "OFF"}"
+        )
+    }
+
+    private fun logHrBatchIfDue(force: Boolean = false) {
+        if (!force && lastHrBatchPoints == 0 && lastHrBatchIbi == 0) return
+        val gapMs = if (lastHrDataMs > 0L) System.currentTimeMillis() - lastHrDataMs else 0L
+        logHrBatch(gapMs, lastHrBatchPoints, lastHrBatchIbi)
+    }
+
+    /** La fiecare 15s — vizibil în logcat chiar fără rafală Samsung. */
+    private fun logHrPulse() {
+        val now = System.currentTimeMillis()
+        if (now - lastHrPulseLogMs < 15_000L) return
+        lastHrPulseLogMs = now
+        val gapMs = if (lastHrDataMs > 0L) now - lastHrDataMs else -1L
+        val trackerOk = heartRateTracker != null
+        synchronized(bufferLock) {
+            Log.i(
+                TAG,
+                "HR pulse: tracker=$trackerOk gapMs=$gapMs ibiWin=${ibiWindow.size} " +
+                    "lastHr=$lastHr scr=${if (displayOn) "ON" else "OFF"} lean=$leanMqtt"
+            )
+        }
+    }
+
+    /**
+     * Lean: IBI rămâne doar în ibiWindow pe ceas (RMSSD acolo).
+     * Batch-uri 4–6 la 4s pe MQTT nu ajută LF/HF (prea puține) — nu mai publicăm.
+     */
+    private fun discardLeanIbiBuffer() {
+        synchronized(bufferLock) {
+            ibiSamples.clear()
+        }
+    }
+
     private fun flushAllMqttBuffers() {
+        if (leanMqtt) {
+            synchronized(bufferLock) {
+                ppgSamples.clear()
+                skinSamples.clear()
+                accSamples.clear()
+                hrSamples.clear()
+                ibiSamples.clear()
+                gyroSamples.clear()
+                lastStepJson = null
+            }
+            return
+        }
         synchronized(bufferLock) {
             flushBuffer("biofizic/ppg", ppgSamples)
             flushBuffer("biofizic/skin_temp", skinSamples)
@@ -1001,9 +1266,10 @@ class SensorService : Service(), SensorEventListener {
                 // Verifica MQTT
                 val connected = ::mqttClient.isInitialized && mqttClient.isConnected
                 isMqttConnected = connected
-                if (!connected) {
+                if (!connected && !mqttConnecting) {
                     Log.w(TAG, "MQTT deconectat, reconectare...")
                     connectMqtt()
+                    Thread.sleep(5_000)  // pauză după tentativă, indiferent de succes
                 }
 
                 // Verifica Samsung SDK
@@ -1057,7 +1323,7 @@ class SensorService : Service(), SensorEventListener {
         lastWindowSec = 0.0
         lastStateMessageMs = 0L
         stopPublishLoops()
-        publishHrvFeatures()
+        publishEpoch()
         flushAllMqttBuffers()
         unregisterScreenReceiver()
         synchronized(bufferLock) {
@@ -1072,6 +1338,10 @@ class SensorService : Service(), SensorEventListener {
             accMagnitudes.clear()
             lastStepJson = null
         }
+        lastHrDataMs = 0L
+        lastHrBatchPoints = 0
+        lastHrBatchIbi = 0
+        lastHrBatchLogMs = 0L
         lastRmssd = 0.0
         watchdogThread?.interrupt()
 
@@ -1102,6 +1372,7 @@ class SensorService : Service(), SensorEventListener {
     override fun onDestroy() {
         super.onDestroy()
         stopAllTracking()
+        leaveForeground()
         if (::wakeLock.isInitialized && wakeLock.isHeld) {
             wakeLock.release()
         }
@@ -1109,20 +1380,7 @@ class SensorService : Service(), SensorEventListener {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        if (isRunning) {
-            val pending = PendingIntent.getService(
-                this, 1,
-                Intent(this, SensorService::class.java).apply { action = ACTION_START },
-                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
-            )
-            (getSystemService(ALARM_SERVICE) as AlarmManager)
-                .setExactAndAllowWhileIdle(
-                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                    SystemClock.elapsedRealtime() + 5_000L,
-                    pending
-                )
-            Log.i(TAG, "onTaskRemoved – restart programat in 5s")
-        }
+        Log.i(TAG, "onTaskRemoved — FGS rămâne până la Stop (fără restart din alarm)")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -1143,11 +1401,19 @@ class SensorService : Service(), SensorEventListener {
             Intent(this, SensorService::class.java).apply { action = ACTION_STOP },
             PendingIntent.FLAG_IMMUTABLE
         )
+        val openAppIntent = PendingIntent.getActivity(
+            this, 1,
+            Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
 
         return Notification.Builder(this, channelId)
             .setContentTitle("Biofizic activ")
             .setContentText(contentText)
             .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentIntent(openAppIntent)
             .addAction(
                 Notification.Action.Builder(
                     null, "Stop", stopIntent
