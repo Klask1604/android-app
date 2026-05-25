@@ -8,13 +8,13 @@ The watch **does not** produce the final affect verdict. It:
 
 1. Reads Samsung Health SDK trackers (HR + IBI, PPG, skin temp, accelerometer)
 2. Filters raw IBI beats (`IbiSignalFilter`)
-3. Publishes 1 Hz MQTT batches to the broker
-4. Subscribes to `biofizic/combined` for UI display (arousal, valence, emotion label)
+3. Publishes 1 Hz MQTT batches to the broker (`ibi/batch`, `ppg/batch`, `sensors/batch`)
+4. Subscribes to `biofizic/state/live` (1 Hz UI) and `biofizic/combined` (retained bootstrap ~30s)
 
 ```
 Samsung SDK → SensorService → MQTT batches → server compute-engine
                     ↑
-            biofizic/combined (display)
+            state/live (1 Hz) + combined (bootstrap)
 ```
 
 ## Requirements
@@ -33,7 +33,7 @@ sdk.dir=C\:\\Users\\YOU\\AppData\\Local\\Android\\Sdk
 mqtt.broker.url=tcp://YOUR_BROKER_HOST:1883
 ```
 
-Default if unset: `tcp://localhost:1883` (BuildConfig).
+Default if unset: `tcp://localhost:1883` (generated `R.string.mqtt_broker_url` from `local.properties`).
 
 Alternatively edit `BROKER_URL` in `SensorService.kt` during development.
 
@@ -51,18 +51,19 @@ Use wireless debugging or `adb connect` for deploy without USB.
 | Topic | Rate | Content |
 |-------|------|---------|
 | `biofizic/ibi/batch` | 1 Hz | Filtered IBI ms + timestamps |
-| `biofizic/ppg/batch` | 1 Hz | PPG green/IR samples |
+| `biofizic/ppg/batch` | 1 Hz | PPG green/IR samples (always; independent of `ppg/raw`) |
 | `biofizic/sensors/batch` | 1 Hz | HR, acc/gyro stats, skin temp |
-| `biofizic/watch/live` | 1 Hz | Debug telemetry (optional) |
-| `biofizic/epoch` | 30 s | Legacy snapshot (compat) |
+| `biofizic/cmd/calibrate` | on demand | Baseline reset request |
 
 ## MQTT topics consumed
 
 | Topic | Purpose |
 |-------|---------|
-| `biofizic/combined` | Arousal, valence, emotion for watch face |
-| `biofizic/state/live` | Server preview (optional) |
+| `biofizic/state/live` | Arousal, valence, emotion for watch face (1 Hz) |
+| `biofizic/combined` | Retained bootstrap when reconnecting (~30s) |
 | `biofizic/calibration/status` | Baseline recalibration feedback |
+
+Optional dev publish: set `ppgRawEnabled = true` in `SensorService` companion to also send `biofizic/ppg/raw` (off by default).
 
 Recalibrate personal baseline: long-press the arousal gauge → sends `biofizic/cmd/calibrate`.
 
@@ -70,9 +71,7 @@ Recalibrate personal baseline: long-press the arousal gauge → sends `biofizic/
 
 `HrvFeatureCalculator` and `IbiSignalFilter` still run on-device for:
 
-- `signalOk` / `hrv_ready` UI hints
-- `biofizic/watch/live` telemetry
-- Legacy `biofizic/epoch` payload
+- `signalOk` / UI hints (local window quality)
 
 **Server HRV is authoritative** for arousal and valence.
 

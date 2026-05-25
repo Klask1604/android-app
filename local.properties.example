@@ -1,3 +1,4 @@
 # Copy to local.properties (not committed)
 sdk.dir=C\:\\Path\\To\\Android\\sdk
-mqtt.broker.url=tcp://localhost:1883
+# Same broker as Licenta/.env MQTT_BROKER — NOT localhost on a physical watch
+mqtt.broker.url=tcp://paxbespoke.automateflow.ro:1883
