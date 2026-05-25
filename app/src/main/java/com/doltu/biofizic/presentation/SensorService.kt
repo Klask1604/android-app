@@ -15,6 +15,10 @@ import android.os.*
 import android.util.Log
 import com.doltu.biofizic.BuildConfig
 import com.doltu.biofizic.R
+import com.doltu.biofizic.signal.HrvFeatureCalculator
+import com.doltu.biofizic.signal.IbiSignalFilter
+import com.doltu.biofizic.signal.IbiWindowEntry
+import com.doltu.biofizic.signal.TimedSample
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -69,14 +73,9 @@ class SensorService : Service(), SensorEventListener {
     companion object {
         const val ACTION_START = "com.doltu.biofizic.ACTION_START"
         const val ACTION_STOP = "com.doltu.biofizic.ACTION_STOP"
-        /** Connect Samsung SDK, list sensors, then stop (no MQTT tracking). */
-        const val ACTION_SCAN = "com.doltu.biofizic.ACTION_SCAN"
         const val ACTION_RECALIBRATE = "com.doltu.biofizic.ACTION_RECALIBRATE"
 
         @Volatile var isRunning = false
-        /** While MainActivity is visible: keep screen on (avoid watch face at ~30s). */
-        /** false = allow screen off (FGS + sensors continue). */
-        @Volatile var keepScreenAwake = false
         @Volatile var isMqttConnected = false
         @Volatile var lastHr = 0
         @Volatile var activeSensors = 0
@@ -89,59 +88,29 @@ class SensorService : Service(), SensorEventListener {
         // Contoare pentru debug / UI
         @Volatile var msgCount = 0L
 
-        /** Raport senzori (Android + Samsung); actualizat la scan / pornire SDK. */
-        @Volatile var sensorReport: String = ""
-        @Volatile var sdkScanDone = false
-
-        /**
-         * MQTT publish interval for all batch topics (ms).
-         * Samples accumulate and ship as one message per topic.
-         * Samsung sensors still sample at native rate (e.g. PPG ~25 Hz); MQTT at 1 Hz.
-         */
-        /** PPG/IBI/HR batch interval on MQTT (1 s). */
         @Volatile var mqttPublishIntervalMs = 1_000L
-        /** Local HRV/signalOk refresh interval (extended log only). */
         @Volatile var hrvPublishIntervalMs = 30_000L
-
-        /** Flush SDK HR to fill ibiWindow (GW7 bursts ~4s). */
         @Volatile var hrFlushIntervalMs = 4_000L
-
-        /** 1 Hz publish for ibi/sensors/ppg batch topics. */
         @Volatile var liveWatchEnabled = true
         private const val LIVE_WATCH_INTERVAL_MS = 1_000L
-
         @Volatile var liveStreamEnabled = true
-
-        /** Raw PPG batch publishing for external DSP pipeline (dev only). */
-        @Volatile var ppgRawEnabled = false
-
-        /** Seconds of PPG to accumulate before flush on biofizic/ppg/raw. */
-        @Volatile var ppgBatchSec = 2
-
         @Volatile var lastSkinTempC = 0.0
         @Volatile var lastAmbientTempC = 0.0
-
         @Volatile var displayOn = true
         @Volatile var backgroundSensorsGranted = true
         @Volatile var lastRmssd = 0.0
 
-        /** From biofizic/combined (compute-engine verdict for watch UI). */
+        /** From biofizic/state/live (compute-engine verdict for watch UI). */
         @Volatile var arousalFused = -1f
         @Volatile var arousal10 = -1
-        @Volatile var valence10 = -1
-        @Volatile var affectQuadrant = "—"
         @Volatile var arousalConfidence = 0f
-        @Volatile var emotionLabel = "—"
+        @Volatile var arousalLabel = "—"
         @Volatile var motionGated = false
         @Volatile var profileReady = false
         @Volatile var calibrationPhase = ""
         @Volatile var calibrationMessage = ""
         @Volatile var signalOk = false
         @Volatile var lastWindowSec = 0.0
-        @Volatile var lastStateMessageMs = 0L
-
-        /** Keep legacy ibi/ppg/sensors topics during v2 rollout (1–2 weeks). */
-        @Volatile var publishLegacyBatches = true
 
         private val _uiState = MutableStateFlow(UiState())
         val uiState: StateFlow<UiState> = _uiState.asStateFlow()
@@ -153,8 +122,7 @@ class SensorService : Service(), SensorEventListener {
                 lastHr = lastHr,
                 arousalFused = arousalFused,
                 arousal10 = arousal10,
-                valence10 = valence10,
-                emotionLabel = emotionLabel,
+                arousalLabel = arousalLabel,
                 arousalConfidence = arousalConfidence,
                 motionGated = motionGated,
                 profileReady = profileReady,
@@ -173,7 +141,6 @@ class SensorService : Service(), SensorEventListener {
         private const val WAKE_LOCK_TIMEOUT_MS = 4 * 60 * 60 * 1000L
     }
 
-    private var scanOnlyMode = false
     private var accScaleLogRemaining = 5
     private var screenReceiverRegistered = false
     private var displayOnLocal = true
@@ -199,7 +166,7 @@ class SensorService : Service(), SensorEventListener {
 
     private val bufferLock = Any()
 
-    // PPG batch for ppg-processor (biofizic/ppg/batch at 1 Hz)
+    // PPG samples are bundled into acquisition/batch v2 (one per second).
     private val ppgBatchLock = Any()
     private val ppgBatch = mutableListOf<Triple<Long, Int, Int>>()  // (ts_ms, green, ir)
 
@@ -208,7 +175,6 @@ class SensorService : Service(), SensorEventListener {
     private var hrvPublishLoopRunning = false
     private var liveWatchLoopRunning = false
     private var mqttPublishLoopRunning = false
-    private var ppgBatchLoopRunning = false
 
     @Volatile private var lastHrDataMs = 0L
     @Volatile private var lastHrBatchPoints = 0
@@ -372,10 +338,6 @@ class SensorService : Service(), SensorEventListener {
             mqttPublishLoopRunning = true
             handler.post(mqttPublishRunnable)
         }
-        if (ppgRawEnabled && !ppgBatchLoopRunning) {
-            ppgBatchLoopRunning = true
-            handler.postDelayed(ppgBatchRunnable, ppgBatchSec * 1000L)
-        }
     }
 
     private fun stopPublishLoops() {
@@ -384,13 +346,11 @@ class SensorService : Service(), SensorEventListener {
         hrvPublishLoopRunning = false
         liveWatchLoopRunning = false
         mqttPublishLoopRunning = false
-        ppgBatchLoopRunning = false
         handler.removeCallbacks(sdkFlushRunnable)
         handler.removeCallbacks(hrFlushRunnable)
         handler.removeCallbacks(hrvPublishRunnable)
         handler.removeCallbacks(liveWatchRunnable)
         handler.removeCallbacks(mqttPublishRunnable)
-        handler.removeCallbacks(ppgBatchRunnable)
     }
 
     // ══════════════════════════════════════════
@@ -399,16 +359,6 @@ class SensorService : Service(), SensorEventListener {
     private val connectionListener = object : ConnectionListener {
         override fun onConnectionSuccess() {
             Log.i(TAG, "Samsung Health SDK conectat")
-            if (scanOnlyMode) {
-                buildSensorInventory(probeAccessibility = true)
-                scanOnlyMode = false
-                if (!isRunning) {
-                    healthTrackingService?.disconnectService()
-                    healthTrackingService = null
-                    stopSelf()
-                }
-                return
-            }
             buildSensorInventory(probeAccessibility = true)
             startSdkTrackers()
         }
@@ -594,37 +544,6 @@ class SensorService : Service(), SensorEventListener {
                 stopSelf()
                 return START_NOT_STICKY
             }
-            ACTION_SCAN -> {
-                if (!promoteToForeground(2, "Scanare senzori…")) {
-                    stopSelf()
-                    return START_NOT_STICKY
-                }
-                Log.i(TAG, "ACTION_SCAN – inventar senzori")
-                acquireWakeLock()
-                scanOnlyMode = true
-                sdkScanDone = false
-                sensorReport = "Scanare în curs…"
-                if (!::sensorManager.isInitialized) {
-                    sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
-                }
-                buildAndroidSensorInventory()
-                Thread {
-                    try {
-                        if (healthTrackingService == null) {
-                            healthTrackingService = HealthTrackingService(connectionListener, this)
-                            healthTrackingService?.connectService()
-                        } else {
-                            buildSensorInventory(probeAccessibility = true)
-                            scanOnlyMode = false
-                        }
-                    } catch (e: Exception) {
-                        sensorReport = "SDK eroare: ${e.message}"
-                        scanOnlyMode = false
-                        Log.e(TAG, "Scan SDK init: ${e.message}")
-                    }
-                }.start()
-                return START_NOT_STICKY
-            }
             ACTION_START -> {
                 if (!promoteToForeground(1, "HR · PPG · ACC · Gyro · Temp")) {
                     stopSelf()
@@ -712,13 +631,27 @@ class SensorService : Service(), SensorEventListener {
                 lines.appendLine("  ${shortTypeName(s.type)}: ${s.name}$marker")
             }
         }
-        sensorReport = lines.toString().trimEnd()
+        val report = lines.toString().trimEnd()
+        Log.d(TAG, "Inventar Android:\n$report")
     }
 
     private fun buildSensorInventory(@Suppress("UNUSED_PARAMETER") probeAccessibility: Boolean) {
-        buildAndroidSensorInventory()
+        val androidLines = StringBuilder()
+        androidLines.appendLine("Android (SensorManager):")
+        val all = sensorManager.getSensorList(Sensor.TYPE_ALL)
+        if (all.isEmpty()) {
+            androidLines.appendLine("  (niciun senzor)")
+        } else {
+            for (s in all) {
+                val marker = when (s.type) {
+                    Sensor.TYPE_GYROSCOPE -> " ← folosit"
+                    else -> ""
+                }
+                androidLines.appendLine("  ${shortTypeName(s.type)}: ${s.name}$marker")
+            }
+        }
         val capabilities = samsungCapabilities()
-        val lines = StringBuilder(sensorReport)
+        val lines = StringBuilder(androidLines.toString().trimEnd())
         lines.appendLine()
         lines.appendLine()
         lines.appendLine("Samsung SDK (capabilities=${capabilities.size}):")
@@ -734,9 +667,7 @@ class SensorService : Service(), SensorEventListener {
             lines.appendLine()
             lines.appendLine("Acces la Start: getHealthTracker()")
         }
-        sensorReport = lines.toString().trimEnd()
-        sdkScanDone = true
-        Log.i(TAG, "── Inventar senzori ──\n$sensorReport")
+        Log.i(TAG, "── Inventar senzori ──\n${lines.toString().trimEnd()}")
     }
 
     private val ppgChannelTypes = setOf(PpgType.GREEN, PpgType.IR, PpgType.RED)
@@ -975,7 +906,9 @@ class SensorService : Service(), SensorEventListener {
                     try {
                         val json = message.payload.decodeToString()
                         when (topic) {
-                            "biofizic/combined" -> parseCombinedMessage(json)
+                            // Retained bootstrap on reconnect (last epoch decision)
+                            // and the same channel that delivers fresh 30 s epochs.
+                            "biofizic/state" -> parseEpochStateMessage(json)
                             "biofizic/state/live" -> parseStateLiveMessage(json)
                             "biofizic/calibration/status" -> parseCalibrationStatus(json)
                         }
@@ -987,11 +920,12 @@ class SensorService : Service(), SensorEventListener {
                 override fun deliveryComplete(token: IMqttDeliveryToken?) {}
             })
             mqttClient.connect(options)
-            mqttClient.subscribe("biofizic/combined", 0)
+            // QoS 1 on state so the retained bootstrap survives a reconnect.
+            mqttClient.subscribe("biofizic/state", 1)
             mqttClient.subscribe("biofizic/state/live", 0)
             mqttClient.subscribe("biofizic/calibration/status", 1)
             isMqttConnected = true
-            Log.i(TAG, "MQTT conectat la $BROKER_URL (+ combined, state/live)")
+            Log.i(TAG, "MQTT conectat la $BROKER_URL (+ state, state/live)")
             syncUiState()
         } catch (e: Exception) {
             isMqttConnected = false
@@ -1290,31 +1224,30 @@ class SensorService : Service(), SensorEventListener {
     private fun applyServerDecision(obj: JSONObject) {
         val a10 = obj.optInt("arousal_10", -1)
         if (a10 < 0) return
-        lastStateMessageMs = System.currentTimeMillis()
         arousal10 = a10.coerceIn(0, 10)
         arousalFused = a10.toFloat().coerceIn(0f, 10f)
-        valence10 = obj.optInt("valence_10", -1)
-        affectQuadrant = obj.optString("affect_quadrant", "—").ifEmpty { "—" }
         arousalConfidence = obj.optDouble("confidence", 0.0).toFloat()
-        emotionLabel = obj.optString("emotion", "—").ifEmpty { "—" }
+        arousalLabel = obj.optString("emotion", "—").ifEmpty { "—" }
         if (obj.has("profile_ready")) {
             profileReady = obj.optBoolean("profile_ready", profileReady)
         }
-        val mode = obj.optString("activity_mode", "")
-        if (mode.isNotEmpty()) {
-            motionGated = mode == "LOCOMOTION"
+        val motionClass = obj.optString("motion_class", "")
+        if (motionClass.isNotEmpty()) {
+            motionGated = motionClass != "STILL"
         }
         syncUiState()
     }
 
-    private fun parseCombinedMessage(json: String) {
+    // Handles both the retained bootstrap message (received once on
+    // (re)subscribe to biofizic/state) and every fresh 30 s epoch update.
+    private fun parseEpochStateMessage(json: String) {
         try {
             val obj = JSONObject(json)
             applyServerDecision(obj)
-            val hrFromCombined = obj.optInt("hr", 0)
-            if (hrFromCombined > 0) lastHr = hrFromCombined
+            val hrFromEpoch = obj.optInt("hr", obj.optInt("mean_hr", 0))
+            if (hrFromEpoch > 0) lastHr = hrFromEpoch
         } catch (e: JSONException) {
-            Log.w(TAG, "parseCombinedMessage: ${e.message}")
+            Log.w(TAG, "parseEpochStateMessage: ${e.message}")
         }
     }
 
@@ -1355,9 +1288,6 @@ class SensorService : Service(), SensorEventListener {
         val ppgSnapshot = snapshotPpgWindow(tsPublish)
         val ibiSlice = drainIbiForPublish(tsPublish)
         publishAcquisitionBatchV2(tsPublish, motion, ppgSnapshot, ibiSlice)
-        if (publishLegacyBatches) {
-            publishLegacyAcquisitionBatches(tsPublish, motion, ppgSnapshot, ibiSlice)
-        }
         syncUiState()
     }
 
@@ -1418,56 +1348,6 @@ class SensorService : Service(), SensorEventListener {
                 "acquisition seq=$acquisitionSeq ibi=${ibiSlice.size} source=$ibiSource ppg=${ppgSnapshot.size}",
             )
         }
-    }
-
-    private fun publishLegacyAcquisitionBatches(
-        ts: Long,
-        motion: MotionWindowStats,
-        ppgSnapshot: List<Triple<Long, Int, Int>>,
-        ibiSlice: List<IbiWindowEntry>,
-    ) {
-        publishIbiBatchFromSlice(ibiSlice, ts)
-        publishPpgBatchFromSnapshot(ppgSnapshot)
-        val payload = buildString {
-            append(
-                """{"ts":$ts,"hr":$lastHr,"acc_rms":${jsonFloat(motion.accRms, 3)},"acc_p90":${jsonFloat(motion.accP90, 3)},"acc_std":${jsonFloat(motion.accStd, 3)},"gyro_rms":${jsonFloat(motion.gyroRms, 4)},"gyro_p90":${jsonFloat(motion.gyroP90, 4)},"gyro_std":${jsonFloat(motion.gyroStd, 4)},"skin_temp":${jsonFloat(lastSkinTempC, 2)},"ambient_temp":${jsonFloat(lastAmbientTempC, 2)},"displayOn":$displayOn}""",
-            )
-        }
-        publish("biofizic/sensors/batch", payload)
-    }
-
-    private fun publishIbiBatchFromSlice(recent: List<IbiWindowEntry>, ts: Long) {
-        if (recent.isEmpty()) return
-        val ibiMs = recent.joinToString(",") { it.ibiMs.toString() }
-        val ibiTs = recent.joinToString(",") { it.ts.toString() }
-        publish("biofizic/ibi/batch", """{"ts":$ts,"ibi_ms":[$ibiMs],"ibi_ts":[$ibiTs]}""")
-    }
-
-    private fun publishIbiBatch(ts: Long) {
-        val recent = drainIbiForPublish(ts)
-        publishIbiBatchFromSlice(recent, ts)
-    }
-
-    private fun publishPpgBatchFromSnapshot(snapshot: List<Triple<Long, Int, Int>>) {
-        if (snapshot.isEmpty()) return
-        val tsArr = snapshot.joinToString(",") { it.first.toString() }
-        val gArr = snapshot.joinToString(",") { it.second.toString() }
-        val irArr = snapshot.joinToString(",") { it.third.toString() }
-        publish(
-            "biofizic/ppg/batch",
-            """{"ts":${snapshot.last().first},"ts_ms":[$tsArr],"green":[$gArr],"ir":[$irArr]}""",
-        )
-    }
-
-    private fun publishPpgBatch(ts: Long) {
-        val snapshot: List<Triple<Long, Int, Int>>
-        synchronized(ppgBatchLock) {
-            val cutoff = ts - 1_000L
-            snapshot = ppgBatch.filter { it.first >= cutoff }
-            if (snapshot.isEmpty()) return
-            ppgBatch.removeAll { it.first >= cutoff }
-        }
-        publishPpgBatchFromSnapshot(snapshot)
     }
 
     private fun publish(topic: String, payload: String, retain: Boolean = false) {
@@ -1550,15 +1430,12 @@ class SensorService : Service(), SensorEventListener {
         isRunning = false
         arousalFused = -1f
         arousal10 = -1
-        valence10 = -1
-        affectQuadrant = "—"
         arousalConfidence = 0f
-        emotionLabel = "—"
+        arousalLabel = "—"
         motionGated = false
         profileReady = false
         signalOk = false
         lastWindowSec = 0.0
-        lastStateMessageMs = 0L
         stopPublishLoops()
         updateSignalStatus()
         unregisterScreenReceiver()

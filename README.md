@@ -1,27 +1,29 @@
 # Biofizic — Android (Galaxy Watch)
 
-Wear OS companion app for **sensor acquisition only**. HRV, baseline, arousal, and valence are computed on the [Python server](https://github.com/YOUR_USER/biofizic-server) — replace with your backend repo URL.
+Wear OS companion app for **sensor acquisition only**. HRV, baseline, and arousal are computed on the Python server (`Licenta/`).
 
 ## Role in the stack
 
 The watch **does not** produce the final affect verdict. It:
 
 1. Reads Samsung Health SDK trackers (HR + IBI, PPG, skin temp, accelerometer)
-2. Filters raw IBI beats (`IbiSignalFilter`)
-3. Publishes 1 Hz MQTT batches to the broker (`ibi/batch`, `ppg/batch`, `sensors/batch`)
-4. Subscribes to `biofizic/state/live` (1 Hz UI) and `biofizic/combined` (retained bootstrap ~30s)
+2. Filters raw IBI beats (`IbiSignalFilter` in `signal/IbiPipeline.kt`)
+3. Publishes 1 Hz **`biofizic/acquisition/batch`** (schema v2: IBI + PPG + motion + HR)
+4. Subscribes to `biofizic/state/live` (1 Hz UI, hysteresis-smoothed by the server) and `biofizic/state` (retained 30 s epoch, doubles as reconnect bootstrap)
 
 ```
-Samsung SDK → SensorService → MQTT batches → server compute-engine
+Samsung SDK → SensorService → acquisition/batch v2 → server compute-engine
                     ↑
             state/live (1 Hz) + combined (bootstrap)
 ```
 
+Watch UI shows **arousal only** (A X/10 + Kubios label). Experimental valence proxy is Grafana-only on the server.
+
 ## Requirements
 
 - Samsung Galaxy Watch 4+ with Samsung Health Platform
-- `samsung-health-sensor-api-*.aar` in `app/libs/` (Samsung developer distribution — not redistributable in public CI)
-- MQTT broker on same network as the watch
+- `samsung-health-sensor-api-*.aar` in `app/libs/`
+- MQTT broker reachable from the watch
 - Permissions: body sensors, background body sensors, internet, wake lock
 
 ## Configure MQTT
@@ -33,9 +35,7 @@ sdk.dir=C\:\\Users\\YOU\\AppData\\Local\\Android\\Sdk
 mqtt.broker.url=tcp://YOUR_BROKER_HOST:1883
 ```
 
-Default if unset: `tcp://localhost:1883` (generated `R.string.mqtt_broker_url` from `local.properties`).
-
-Alternatively edit `BROKER_URL` in `SensorService.kt` during development.
+Default if unset: `tcp://localhost:1883` (via `R.string.mqtt_broker_url` in `build.gradle.kts`).
 
 ## Build & install
 
@@ -44,59 +44,39 @@ Alternatively edit `BROKER_URL` in `SensorService.kt` during development.
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Use wireless debugging or `adb connect` for deploy without USB.
-
 ## MQTT topics published
 
 | Topic | Rate | Content |
 |-------|------|---------|
-| `biofizic/ibi/batch` | 1 Hz | Filtered IBI ms + timestamps |
-| `biofizic/ppg/batch` | 1 Hz | PPG green/IR samples (always; independent of `ppg/raw`) |
-| `biofizic/sensors/batch` | 1 Hz | HR, acc/gyro stats, skin temp |
+| `biofizic/acquisition/batch` | 1 Hz | Schema v2 with IBI, PPG, motion stats and HR in a single payload |
 | `biofizic/cmd/calibrate` | on demand | Baseline reset request |
 
 ## MQTT topics consumed
 
 | Topic | Purpose |
 |-------|---------|
-| `biofizic/state/live` | Arousal, valence, emotion for watch face (1 Hz) |
-| `biofizic/combined` | Retained bootstrap when reconnecting (~30s) |
+| `biofizic/state/live` | Arousal + Kubios label for the watch face (1 Hz, hysteresis-smoothed) |
+| `biofizic/state` | Retained 30 s epoch decision; arrives immediately on reconnect as bootstrap |
 | `biofizic/calibration/status` | Baseline recalibration feedback |
 
-Optional dev publish: set `ppgRawEnabled = true` in `SensorService` companion to also send `biofizic/ppg/raw` (off by default).
+Optional dev publish: set `ppgRawEnabled = true` in `SensorService` companion for `biofizic/ppg/raw`.
 
 Recalibrate personal baseline: long-press the arousal gauge → sends `biofizic/cmd/calibrate`.
 
 ## Local HRV on watch (not used for decisions)
 
-`HrvFeatureCalculator` and `IbiSignalFilter` still run on-device for:
-
-- `signalOk` / UI hints (local window quality)
-
-**Server HRV is authoritative** for arousal and valence.
+`HrvFeatureCalculator` runs on-device for `signalOk` UI hints only. **Server HRV is authoritative** for arousal.
 
 ## Project structure
 
 ```
-app/src/main/java/com/doltu/biofizic/presentation/
-  SensorService.kt       Foreground service, SDK + MQTT
-  MainActivity.kt        Watch face UI (Compose)
-  IbiSignalFilter.kt     Beat acceptance / normalization
-  HrvFeatureCalculator.kt Local RMSSD (telemetry only)
+app/src/main/java/com/doltu/biofizic/
+  presentation/SensorService.kt   Foreground service, SDK + MQTT
+  presentation/MainActivity.kt    Watch face UI (Compose)
+  presentation/UiState.kt         UI snapshot
+  signal/IbiPipeline.kt           IBI filter + local RMSSD
 ```
-
-## What not to commit
-
-Already in `.gitignore`; if previously tracked, untrack with:
-
-```bash
-git rm -r --cached .idea .kotlin build .gradle 2>/dev/null || true
-git rm --cached local.properties 2>/dev/null || true
-```
-
-Never commit: `local.properties`, `.idea/`, `build/`, `.gradle/`, `.kotlin/`, SDK error logs.
 
 ## Related documentation
 
-- Server architecture & formulas: backend repo `docs/architecture.md`
-- Grafana dashboards: generated by backend `scripts/generate_grafana_dashboards.py`
+- Server: `Licenta/docs/E2E_ARCHITECTURE.md`, `Licenta/docs/THESIS_LIMITATIONS.md`

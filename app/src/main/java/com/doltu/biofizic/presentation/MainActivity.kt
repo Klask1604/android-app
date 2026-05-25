@@ -122,11 +122,7 @@ class MainActivity : ComponentActivity() {
     }
 
     internal fun applyKeepScreenOn() {
-        if (SensorService.isRunning && SensorService.keepScreenAwake) {
-            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        } else {
-            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        }
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
     private fun maybeRequestBatteryExemption() {
@@ -208,8 +204,7 @@ fun BiofizicWatchApp() {
                 hr = uiState.lastHr,
                 arousalFused = uiState.arousalFused,
                 arousal10 = uiState.arousal10,
-                valence10 = uiState.valence10,
-                emotion = uiState.emotionLabel,
+                arousalLabel = uiState.arousalLabel,
                 confidence = uiState.arousalConfidence,
                 motionGated = uiState.motionGated,
                 profileReady = uiState.profileReady,
@@ -279,8 +274,7 @@ private fun WatchFaceContent(
     hr: Int,
     arousalFused: Float,
     arousal10: Int,
-    valence10: Int,
-    emotion: String,
+    arousalLabel: String,
     confidence: Float,
     motionGated: Boolean,
     profileReady: Boolean,
@@ -350,7 +344,7 @@ private fun WatchFaceContent(
         Text(
             text = when {
                 calibrating && calMessage.isNotBlank() -> calMessage
-                hasVerdict -> emotion
+                hasVerdict -> arousalLabel
                 isRunning && !mqttOk -> "Fără server"
                 isRunning -> "Se încarcă"
                 else -> "Gata"
@@ -366,7 +360,7 @@ private fun WatchFaceContent(
         Text(
             text = metaLine(
                 isRunning, hasVerdict, hr, confidence, motionGated,
-                profileReady, signalOk, windowSec, calibrating, valence10,
+                profileReady, signalOk, windowSec, calibrating,
             ),
             fontSize = 7.sp,
             color = TextMuted,
@@ -523,7 +517,6 @@ private fun metaLine(
     signalOk: Boolean,
     windowSec: Float,
     calibrating: Boolean = false,
-    valence10: Int = -1,
 ): String = when {
     calibrating -> "5 min repaus liniștit"
     !isRunning -> "Start · ține apăsat gauge = recalibrare"
@@ -531,8 +524,6 @@ private fun metaLine(
     !signalOk && windowSec > 0f -> "Fereastră ${windowSec.toInt()}s · min 10s"
     !signalOk -> "Aștept HRV"
     motionGated -> "Mișcare · ${hr}bpm"
-    hasVerdict && valence10 >= 0 && hr > 0 ->
-        "V ${valence10}/10 · Conf ${(confidence * 100).toInt()}% · ${hr}bpm"
     hasVerdict && hr > 0 -> "Conf ${(confidence * 100).toInt()}% · ${hr}bpm"
     hr > 0 -> "${hr}bpm"
     else -> "Aștept"

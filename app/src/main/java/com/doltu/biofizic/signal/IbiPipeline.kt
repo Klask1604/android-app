@@ -1,10 +1,58 @@
-package com.doltu.biofizic.presentation
+package com.doltu.biofizic.signal
 
 import kotlin.math.abs
 import kotlin.math.sqrt
 
+/** Un interval IBI (ms) cu timestamp senzor — pentru fereastră HRV pe timp. */
+data class IbiWindowEntry(
+    val ibiMs: Int,
+    val ts: Long,
+    val tsSource: String = "reconstructed",
+)
+
+/** Sensor reading with Samsung SDK or wall-clock timestamp (epoch ms). */
+data class TimedSample(val ts: Long, val value: Double)
+
 /**
- * Feature-uri HRV din intervale IBI (ms) cu timestamp.
+ * Filtru minim IBI: status Samsung + interval fiziologic (ms).
+ * Range 300–2000 ms aliniat cu server; outlier median 20% doar server-side.
+ */
+object IbiSignalFilter {
+
+    const val MIN_IBI_MS = 300
+    const val MAX_IBI_MS = 2_000
+
+    fun isStatusOk(status: Int?): Boolean =
+        status == null || status == 0 || status == -1
+
+    fun isPhysiological(ibiMs: Int): Boolean = ibiMs in MIN_IBI_MS..MAX_IBI_MS
+
+    /** GW7 poate trimite 62 în loc de 620 ms — scalare ×10 când e plauzibil. */
+    fun normalizeIbiMs(raw: Int, hrBpm: Int): Int {
+        if (raw in MIN_IBI_MS..MAX_IBI_MS) return raw
+        if (raw in 30..250) {
+            val scaled = raw * 10
+            if (scaled in MIN_IBI_MS..MAX_IBI_MS) {
+                if (hrBpm > 0) {
+                    val expected = 60_000 / hrBpm
+                    if (abs(scaled - expected) < abs(raw - expected)) return scaled
+                } else {
+                    return scaled
+                }
+            }
+        }
+        return raw
+    }
+
+    fun acceptBeat(rawIbiMs: Int, status: Int?, hrBpm: Int): Int? {
+        if (!isStatusOk(status)) return null
+        val norm = normalizeIbiMs(rawIbiMs, hrBpm)
+        return if (isPhysiological(norm)) norm else null
+    }
+}
+
+/**
+ * Feature-uri HRV locale pentru signalOk UI (verdict final pe server).
  * [windowSec] = sumă IBI valide / 1000 → durată cardiacă acoperită de fereastră.
  */
 object HrvFeatureCalculator {
@@ -19,20 +67,17 @@ object HrvFeatureCalculator {
         val windowSec: Double,
     )
 
-    private const val MIN_IBI_MS = 300
-    private const val MAX_IBI_MS = 2_000
-    /** Pereche (a,b) acceptată dacă |Δt_ts − IBI_b| < prag (evită gap-uri artefact). */
+    private const val MIN_IBI_MS = IbiSignalFilter.MIN_IBI_MS
+    private const val MAX_IBI_MS = IbiSignalFilter.MAX_IBI_MS
     private const val MAX_IBI_TS_MISMATCH_MS = 250L
 
     fun compute(ibiEntries: List<IbiWindowEntry>): Features? {
         val physiological = ibiEntries.filter { it.ibiMs in MIN_IBI_MS..MAX_IBI_MS }
         if (physiological.size < 2) return null
 
-        // Filtru median Oura-style: respinge IBI care se abate >20% de la mediana
-        // Previne artefacte rare (300ms sau 2000ms) care infleaza RMSSD cu sute de ms
         val sorted = physiological.map { it.ibiMs }.sorted()
         val median = sorted[sorted.size / 2].toDouble()
-        val valid = physiological.filter { kotlin.math.abs(it.ibiMs - median) < 0.20 * median }
+        val valid = physiological.filter { abs(it.ibiMs - median) < 0.20 * median }
         if (valid.size < 2) return null
 
         val mean = valid.map { it.ibiMs.toDouble() }.average()
@@ -60,7 +105,6 @@ object HrvFeatureCalculator {
         )
     }
 
-    /** Preferă perechi cu timestamp coerent; fallback la ΔIBI simplu (rafale GW7 = același ts). */
     private fun successiveDiffs(valid: List<IbiWindowEntry>): List<Double> {
         val withTs = successiveDiffsWithTemporalCheck(valid)
         if (withTs.isNotEmpty()) return withTs
