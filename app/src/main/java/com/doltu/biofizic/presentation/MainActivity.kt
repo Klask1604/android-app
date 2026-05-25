@@ -195,6 +195,7 @@ fun BiofizicWatchApp() {
     var hr by remember { mutableIntStateOf(0) }
     var arousalFused by remember { mutableFloatStateOf(-1f) }
     var arousal10 by remember { mutableIntStateOf(-1) }
+    var valence10 by remember { mutableIntStateOf(-1) }
     var emotion by remember { mutableStateOf("—") }
     var confidence by remember { mutableFloatStateOf(0f) }
     var motionGated by remember { mutableStateOf(false) }
@@ -214,6 +215,7 @@ fun BiofizicWatchApp() {
             hr = SensorService.lastHr
             arousalFused = SensorService.arousalFused
             arousal10 = SensorService.arousal10
+            valence10 = SensorService.valence10
             emotion = SensorService.emotionLabel
             confidence = SensorService.arousalConfidence
             motionGated = SensorService.motionGated
@@ -242,6 +244,7 @@ fun BiofizicWatchApp() {
                 hr = hr,
                 arousalFused = arousalFused,
                 arousal10 = arousal10,
+                valence10 = valence10,
                 emotion = emotion,
                 confidence = confidence,
                 motionGated = motionGated,
@@ -312,6 +315,7 @@ private fun WatchFaceContent(
     hr: Int,
     arousalFused: Float,
     arousal10: Int,
+    valence10: Int,
     emotion: String,
     confidence: Float,
     motionGated: Boolean,
@@ -398,7 +402,7 @@ private fun WatchFaceContent(
         Text(
             text = metaLine(
                 isRunning, hasVerdict, hr, confidence, motionGated,
-                profileReady, signalOk, windowSec, calibrating,
+                profileReady, signalOk, windowSec, calibrating, valence10,
             ),
             fontSize = 7.sp,
             color = TextMuted,
@@ -555,13 +559,16 @@ private fun metaLine(
     signalOk: Boolean,
     windowSec: Float,
     calibrating: Boolean = false,
+    valence10: Int = -1,
 ): String = when {
     calibrating -> "5 min repaus liniștit"
     !isRunning -> "Start · ține apăsat gauge = recalibrare"
-    !hasVerdict -> "Aștept verdict fusion"
+    !hasVerdict -> "Aștept verdict server"
     !signalOk && windowSec > 0f -> "Fereastră ${windowSec.toInt()}s · min 10s"
     !signalOk -> "Aștept HRV"
     motionGated -> "Mișcare · ${hr}bpm"
+    hasVerdict && valence10 >= 0 && hr > 0 ->
+        "V ${valence10}/10 · Conf ${(confidence * 100).toInt()}% · ${hr}bpm"
     hasVerdict && hr > 0 -> "Conf ${(confidence * 100).toInt()}% · ${hr}bpm"
     hr > 0 -> "${hr}bpm"
     else -> "Aștept"

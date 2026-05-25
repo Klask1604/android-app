@@ -13,6 +13,7 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.*
 import android.util.Log
+import com.doltu.biofizic.BuildConfig
 import org.json.JSONException
 import org.json.JSONObject
 import com.samsung.android.service.health.tracking.ConnectionListener
@@ -32,11 +33,11 @@ import kotlin.math.sqrt
 
 class SensorService : Service(), SensorEventListener {
 
-    /** JSON MQTT trebuie punct zecimal (Locale.US), nu virgulă RO. */
+    /** MQTT JSON must use Locale.US decimal point, not comma. */
     private fun jsonFloat(value: Double, decimals: Int): String =
         String.format(Locale.US, "%.${decimals}f", value)
 
-    /** RMS (caller), p90, std pentru magnitudini epoch (~30s buffer). */
+    /** RMS (caller), p90, std for epoch magnitude buffers (~30s). */
     private fun magnitudeStats(values: List<Double>): Triple<Double, Double, Double> {
         if (values.isEmpty()) return Triple(0.0, 0.0, 0.0)
         val sorted = values.sorted()
@@ -52,7 +53,7 @@ class SensorService : Service(), SensorEventListener {
 
     // ── MQTT ──
     private lateinit var mqttClient: MqttClient
-    private val BROKER_URL = "tcp://paxbespoke.automateflow.ro:1883"
+    private val BROKER_URL = BuildConfig.MQTT_BROKER_URL
     private val CLIENT_ID = "GalaxyWatch7"
 
     // ── Samsung Health SDK ──
@@ -70,18 +71,18 @@ class SensorService : Service(), SensorEventListener {
     private var watchdogThread: Thread? = null
 
     // ══════════════════════════════════════════
-    //  Companion: stare expusa catre UI
+    //  Companion: state exposed to UI
     // ══════════════════════════════════════════
     companion object {
         const val ACTION_START = "com.doltu.biofizic.ACTION_START"
         const val ACTION_STOP = "com.doltu.biofizic.ACTION_STOP"
-        /** Conectează Samsung SDK, listează senzorii și se oprește (fără tracking MQTT). */
+        /** Connect Samsung SDK, list sensors, then stop (no MQTT tracking). */
         const val ACTION_SCAN = "com.doltu.biofizic.ACTION_SCAN"
         const val ACTION_RECALIBRATE = "com.doltu.biofizic.ACTION_RECALIBRATE"
 
         @Volatile var isRunning = false
-        /** Cât timp MainActivity e vizibilă: ține ecranul aprins (evită watch face la ~30s). */
-        /** false = lasă ceasul să stingă ecranul (FGS + senzori continuă). */
+        /** While MainActivity is visible: keep screen on (avoid watch face at ~30s). */
+        /** false = allow screen off (FGS + sensors continue). */
         @Volatile var keepScreenAwake = false
         @Volatile var isMqttConnected = false
         @Volatile var lastHr = 0
@@ -100,38 +101,38 @@ class SensorService : Service(), SensorEventListener {
         @Volatile var sdkScanDone = false
 
         /**
-         * La câte ms se trimit datele pe MQTT (toate tipurile).
-         * Eșantioanele se acumulează și pleacă într-un singur mesaj per topic.
-         * Senzorul Samsung tot măsoară la rata lui (ex. PPG ~25 Hz); MQTT doar la 1 s.
+         * MQTT publish interval for all batch topics (ms).
+         * Samples accumulate and ship as one message per topic.
+         * Samsung sensors still sample at native rate (e.g. PPG ~25 Hz); MQTT at 1 Hz.
          */
-        /** Batch PPG/IBI/HR pe MQTT (1 s). */
+        /** PPG/IBI/HR batch interval on MQTT (1 s). */
         @Volatile var mqttPublishIntervalMs = 1_000L
-        /** Lean: un singur pachet biofizic/epoch la 30s (IBI brut + HRV). */
+        /** Legacy: single biofizic/epoch every 30s (raw IBI + HRV). */
         @Volatile var hrvPublishIntervalMs = 30_000L
 
         /**
-         * true = doar biofizic/features; fără batch ppg/ibi/hr/acc/gyro pe MQTT.
+         * true = biofizic/features only; no ppg/ibi/hr/acc/gyro batch MQTT.
          */
         @Volatile var leanMqtt = true
 
-        /** Flush SDK HR → umple ibiWindow (rafale GW7 ~4s). */
+        /** Flush SDK HR to fill ibiWindow (GW7 bursts ~4s). */
         @Volatile var hrFlushIntervalMs = 4_000L
 
-        /** PPG: câte un mesaj MQTT per eșantion pe biofizic/ppg/stream (pentru semnal + jitter). */
+        /** One MQTT message per PPG sample on biofizic/ppg/stream (signal + jitter debug). */
         @Volatile var ppgStreamEnabled = false
 
-        /** Stream unificat 1 Hz — toate senzorii + HRV rolling + clasificare. */
+        /** Unified 1 Hz stream — all sensors + rolling HRV + classification. */
         @Volatile var liveWatchEnabled = true
         private const val LIVE_WATCH_INTERVAL_MS = 1_000L
 
-        /** Stream live ACC (1 Hz) și HR instant pentru context server-side. */
+        /** Live ACC (1 Hz) and instant HR for server-side context. */
         @Volatile var liveStreamEnabled = true
         @Volatile var liveAccIntervalMs = 1_000L
 
-        /** PPG raw batch publishing pentru pipeline-ul DSP extern. */
+        /** Raw PPG batch publishing for external DSP pipeline. */
         @Volatile var ppgRawEnabled = true
 
-        /** Câte secunde de PPG acumulezi înainte de flush pe biofizic/ppg/raw. */
+        /** Seconds of PPG to accumulate before flush on biofizic/ppg/raw. */
         @Volatile var ppgBatchSec = 2
 
         @Volatile var lastSkinTempC = 0.0
@@ -141,9 +142,11 @@ class SensorService : Service(), SensorEventListener {
         @Volatile var backgroundSensorsGranted = true
         @Volatile var lastRmssd = 0.0
 
-        /** Din biofizic/combined (fusion v2+v3 — verdict final pe ceas). */
+        /** From biofizic/combined (compute-engine verdict for watch UI). */
         @Volatile var arousalFused = -1f
         @Volatile var arousal10 = -1
+        @Volatile var valence10 = -1
+        @Volatile var affectQuadrant = "—"
         @Volatile var arousalConfidence = 0f
         @Volatile var emotionLabel = "—"
         @Volatile var motionGated = false
@@ -154,7 +157,7 @@ class SensorService : Service(), SensorEventListener {
         @Volatile var lastWindowSec = 0.0
         @Volatile var lastStateMessageMs = 0L
 
-        /** Din biofizic/state/live (server, ~1 Hz). */
+        /** From biofizic/state/live (server preview, ~1 Hz). */
         @Volatile var serverArousal10 = -1
         @Volatile var serverEmotion = "—"
         @Volatile var serverActivityMode = "UNKNOWN"
@@ -1335,19 +1338,20 @@ class SensorService : Service(), SensorEventListener {
     private fun parseCombinedMessage(json: String) {
         try {
             val obj = JSONObject(json)
-            val fused = obj.optDouble("arousal_fused", -1.0)
-            if (fused < 0) return
+            val a10 = obj.optInt("arousal_10", -1)
+            if (a10 < 0) return
             lastStateMessageMs = System.currentTimeMillis()
-            arousalFused = fused.toFloat().coerceIn(0f, 10f)
-            arousal10 = kotlin.math.round(arousalFused).toInt().coerceIn(0, 10)
-            arousalConfidence = obj.optDouble("confidence_fused", 0.0).toFloat()
-            emotionLabel = obj.optString("arousal_label", "—").ifEmpty { "—" }
+            arousal10 = a10.coerceIn(0, 10)
+            arousalFused = a10.toFloat().coerceIn(0f, 10f)
+            valence10 = obj.optInt("valence_10", -1)
+            affectQuadrant = obj.optString("affect_quadrant", "—").ifEmpty { "—" }
+            arousalConfidence = obj.optDouble("confidence", 0.0).toFloat()
+            emotionLabel = obj.optString("emotion", "—").ifEmpty { "—" }
             profileReady = obj.optBoolean("profile_ready", profileReady)
             val mode = obj.optString("activity_mode", "")
-            motionGated = obj.optBoolean("context_suppress_alert", false)
-                && mode == "LOCOMOTION"
-            val hrFromFusion = obj.optInt("hr", 0)
-            if (hrFromFusion > 0) lastHr = hrFromFusion
+            motionGated = mode == "LOCOMOTION"
+            val hrFromCombined = obj.optInt("hr", 0)
+            if (hrFromCombined > 0) lastHr = hrFromCombined
         } catch (e: JSONException) {
             Log.w(TAG, "parseCombinedMessage: ${e.message}")
         }
@@ -1461,14 +1465,13 @@ class SensorService : Service(), SensorEventListener {
             }
         }
 
-        val arousalF = if (arousalFused >= 0f) jsonFloat(arousalFused.toDouble(), 2) else "null"
         val arousal10Val = if (arousal10 >= 0) arousal10 else -1
         val serverA10 = if (serverArousal10 >= 0) serverArousal10 else -1
 
         val payload = buildString {
             append("""{"ts":$ts,"live":true,"display_on":$displayOn,"mqtt_connected":$isMqttConnected,"hr":$lastHr,"hr_status":${if (lastHr > 0) 1 else 0},"acc_rms":${jsonFloat(accRms, 3)},"acc_mag":${jsonFloat(accMag, 3)},"gyro_rms":${jsonFloat(gyroRms, 4)},"skin_temp_c":${jsonFloat(lastSkinTempC, 2)},"ambient_temp_c":${jsonFloat(lastAmbientTempC, 2)},"ppg_n":$ppgN,"ppg_green_mean":${jsonFloat(ppgGreenMean, 1)},"ppg_green_std":${jsonFloat(ppgGreenStd, 1)},"ppg_ir_mean":${jsonFloat(ppgIrMean, 1)},"ppg_red_mean":${jsonFloat(ppgRedMean, 1)},"steps":${lastSteps.toInt()}""")
             append(""","ibi_n":$ibiN,"ibi_window_sec":${jsonFloat(windowSec, 1)},"sec_since_ibi":${jsonFloat(secSinceIbi, 1)},"hrv_ready":$hrvReady,"rmssd_live":${jsonFloat(rmssdLive, 2)},"sdnn_live":${jsonFloat(sdnnLive, 2)},"mean_hr_live":${jsonFloat(meanHrLive, 1)},"mean_ibi_live":${jsonFloat(meanIbiLive, 1)},"pnn50_live":${jsonFloat(pnn50Live, 1)}""")
-            append(""","arousal_fused":$arousalF,"arousal_10":$arousal10Val,"confidence":${jsonFloat(arousalConfidence.toDouble(), 3)},"emotion":"${emotionLabel.replace("\"", "")}","profile_ready":$profileReady,"signal_ok":$signalOk""")
+            append(""","arousal_10":$arousal10Val,"valence_10":${if (valence10 >= 0) valence10 else -1},"affect_quadrant":"${affectQuadrant.replace("\"", "")}","confidence":${jsonFloat(arousalConfidence.toDouble(), 3)},"emotion":"${emotionLabel.replace("\"", "")}","profile_ready":$profileReady,"signal_ok":$signalOk""")
             append(""","server_arousal_10":$serverA10,"server_emotion":"${serverEmotion.replace("\"", "")}","server_activity_mode":"${serverActivityMode.replace("\"", "")}","server_motion_z":${jsonFloat(serverMotionZ.toDouble(), 3)},"server_z_hr":${jsonFloat(serverZHr.toDouble(), 3)}}""")
         }
         publish("biofizic/watch/live", payload)
@@ -1640,6 +1643,8 @@ class SensorService : Service(), SensorEventListener {
         isRunning = false
         arousalFused = -1f
         arousal10 = -1
+        valence10 = -1
+        affectQuadrant = "—"
         arousalConfidence = 0f
         emotionLabel = "—"
         motionGated = false

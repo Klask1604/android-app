@@ -1,0 +1,3 @@
+# Copy to local.properties (not committed)
+sdk.dir=C\:\\Path\\To\\Android\\sdk
+mqtt.broker.url=tcp://localhost:1883

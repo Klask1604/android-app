@@ -4,6 +4,8 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+import java.util.Properties
+
 android {
     namespace = "com.doltu.biofizic"
     compileSdk {
@@ -17,6 +19,12 @@ android {
         versionCode = 1
         versionName = "1.0"
 
+        val localProps = Properties()
+        rootProject.file("local.properties").takeIf { it.exists() }?.inputStream()?.use {
+            localProps.load(it)
+        }
+        val mqttUrl = localProps.getProperty("mqtt.broker.url", "tcp://localhost:1883")
+        buildConfigField("String", "MQTT_BROKER_URL", "\"$mqttUrl\"")
     }
 
     buildTypes {
@@ -38,6 +46,7 @@ android {
     useLibrary("wear-sdk")
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 
