@@ -34,11 +34,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -61,7 +57,6 @@ import androidx.wear.compose.material.Button
 import androidx.wear.compose.material.ButtonDefaults
 import androidx.wear.compose.material.MaterialTheme
 import androidx.wear.compose.material.Text
-import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
 
@@ -189,42 +184,11 @@ private val RING_MAX = 74.dp
 @Composable
 fun BiofizicWatchApp() {
     val context = LocalContext.current
+    val uiState by SensorService.uiState.collectAsStateWithLifecycle()
 
-    var isRunning by remember { mutableStateOf(SensorService.isRunning) }
-    var mqttOk by remember { mutableStateOf(false) }
-    var hr by remember { mutableIntStateOf(0) }
-    var arousalFused by remember { mutableFloatStateOf(-1f) }
-    var arousal10 by remember { mutableIntStateOf(-1) }
-    var valence10 by remember { mutableIntStateOf(-1) }
-    var emotion by remember { mutableStateOf("—") }
-    var confidence by remember { mutableFloatStateOf(0f) }
-    var motionGated by remember { mutableStateOf(false) }
-    var profileReady by remember { mutableStateOf(false) }
-    var signalOk by remember { mutableStateOf(false) }
-    var windowSec by remember { mutableFloatStateOf(0f) }
-    var calibrating by remember { mutableStateOf(false) }
-    var calMessage by remember { mutableStateOf("") }
-
-    LaunchedEffect(Unit) {
-        while (true) {
-            isRunning = SensorService.isRunning
-            if (isRunning) {
-                (context as? MainActivity)?.applyKeepScreenOn()
-            }
-            mqttOk = SensorService.isMqttConnected
-            hr = SensorService.lastHr
-            arousalFused = SensorService.arousalFused
-            arousal10 = SensorService.arousal10
-            valence10 = SensorService.valence10
-            emotion = SensorService.emotionLabel
-            confidence = SensorService.arousalConfidence
-            motionGated = SensorService.motionGated
-            profileReady = SensorService.profileReady
-            signalOk = SensorService.signalOk
-            windowSec = SensorService.lastWindowSec.toFloat()
-            calibrating = SensorService.calibrationPhase == "collecting"
-            calMessage = SensorService.calibrationMessage
-            delay(400)
+    LaunchedEffect(uiState.isRunning) {
+        if (uiState.isRunning) {
+            (context as? MainActivity)?.applyKeepScreenOn()
         }
     }
 
@@ -239,24 +203,24 @@ fun BiofizicWatchApp() {
             val ringSize = (minSide * RING_FRACTION).coerceIn(RING_MIN, RING_MAX)
 
             WatchFaceContent(
-                isRunning = isRunning,
-                mqttOk = mqttOk,
-                hr = hr,
-                arousalFused = arousalFused,
-                arousal10 = arousal10,
-                valence10 = valence10,
-                emotion = emotion,
-                confidence = confidence,
-                motionGated = motionGated,
-                profileReady = profileReady,
-                signalOk = signalOk,
-                windowSec = windowSec,
-                calibrating = calibrating,
-                calMessage = calMessage,
+                isRunning = uiState.isRunning,
+                mqttOk = uiState.isMqttConnected,
+                hr = uiState.lastHr,
+                arousalFused = uiState.arousalFused,
+                arousal10 = uiState.arousal10,
+                valence10 = uiState.valence10,
+                emotion = uiState.emotionLabel,
+                confidence = uiState.arousalConfidence,
+                motionGated = uiState.motionGated,
+                profileReady = uiState.profileReady,
+                signalOk = uiState.signalOk,
+                windowSec = uiState.lastWindowSec.toFloat(),
+                calibrating = uiState.calibrationPhase == "collecting",
+                calMessage = uiState.calibrationMessage,
                 contentWidth = contentW,
                 ringSize = ringSize,
                 onLongPressRecalibrate = {
-                    if (isRunning) {
+                    if (uiState.isRunning) {
                         context.startForegroundService(
                             Intent(context, SensorService::class.java).apply {
                                 action = SensorService.ACTION_RECALIBRATE
@@ -271,13 +235,13 @@ fun BiofizicWatchApp() {
             )
 
             val btnColor by animateColorAsState(
-                if (isRunning) BtnStop else BtnStart,
+                if (uiState.isRunning) BtnStop else BtnStart,
                 animationSpec = tween(200),
                 label = "btn",
             )
             Button(
                 onClick = {
-                    val action = if (isRunning) SensorService.ACTION_STOP
+                    val action = if (uiState.isRunning) SensorService.ACTION_STOP
                     else SensorService.ACTION_START
                     context.startForegroundService(
                         Intent(context, SensorService::class.java).apply { this.action = action },
@@ -297,7 +261,7 @@ fun BiofizicWatchApp() {
                     .size(width = (contentW * 0.72f).coerceAtLeast(52.dp), height = 28.dp),
             ) {
                 Text(
-                    text = if (isRunning) "Stop" else "Start",
+                    text = if (uiState.isRunning) "Stop" else "Start",
                     fontSize = 10.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = Color.White,
