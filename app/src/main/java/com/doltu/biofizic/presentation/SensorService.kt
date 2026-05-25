@@ -36,6 +36,17 @@ class SensorService : Service(), SensorEventListener {
     private fun jsonFloat(value: Double, decimals: Int): String =
         String.format(Locale.US, "%.${decimals}f", value)
 
+    /** RMS (caller), p90, std pentru magnitudini epoch (~30s buffer). */
+    private fun magnitudeStats(values: List<Double>): Triple<Double, Double, Double> {
+        if (values.isEmpty()) return Triple(0.0, 0.0, 0.0)
+        val sorted = values.sorted()
+        val rms = sqrt(values.map { it * it }.average())
+        val p90Idx = ((sorted.size - 1) * 0.9).toInt().coerceIn(0, sorted.size - 1)
+        val mean = values.average()
+        val std = sqrt(values.map { (it - mean) * (it - mean) }.average())
+        return Triple(rms, sorted[p90Idx], std)
+    }
+
     // ── Android sensors ──
     private lateinit var sensorManager: SensorManager
 
@@ -66,6 +77,7 @@ class SensorService : Service(), SensorEventListener {
         const val ACTION_STOP = "com.doltu.biofizic.ACTION_STOP"
         /** Conectează Samsung SDK, listează senzorii și se oprește (fără tracking MQTT). */
         const val ACTION_SCAN = "com.doltu.biofizic.ACTION_SCAN"
+        const val ACTION_RECALIBRATE = "com.doltu.biofizic.ACTION_RECALIBRATE"
 
         @Volatile var isRunning = false
         /** Cât timp MainActivity e vizibilă: ține ecranul aprins (evită watch face la ~30s). */
@@ -108,6 +120,14 @@ class SensorService : Service(), SensorEventListener {
         /** PPG: câte un mesaj MQTT per eșantion pe biofizic/ppg/stream (pentru semnal + jitter). */
         @Volatile var ppgStreamEnabled = false
 
+        /** Stream unificat 1 Hz — toate senzorii + HRV rolling + clasificare. */
+        @Volatile var liveWatchEnabled = true
+        private const val LIVE_WATCH_INTERVAL_MS = 1_000L
+
+        /** Stream live ACC (1 Hz) și HR instant pentru context server-side. */
+        @Volatile var liveStreamEnabled = true
+        @Volatile var liveAccIntervalMs = 1_000L
+
         /** PPG raw batch publishing pentru pipeline-ul DSP extern. */
         @Volatile var ppgRawEnabled = true
 
@@ -121,15 +141,25 @@ class SensorService : Service(), SensorEventListener {
         @Volatile var backgroundSensorsGranted = true
         @Volatile var lastRmssd = 0.0
 
-        /** Din biofizic/state (clasificator v2 pe VPS). */
+        /** Din biofizic/combined (fusion v2+v3 — verdict final pe ceas). */
+        @Volatile var arousalFused = -1f
         @Volatile var arousal10 = -1
         @Volatile var arousalConfidence = 0f
         @Volatile var emotionLabel = "—"
         @Volatile var motionGated = false
         @Volatile var profileReady = false
+        @Volatile var calibrationPhase = ""
+        @Volatile var calibrationMessage = ""
         @Volatile var signalOk = false
         @Volatile var lastWindowSec = 0.0
         @Volatile var lastStateMessageMs = 0L
+
+        /** Din biofizic/state/live (server, ~1 Hz). */
+        @Volatile var serverArousal10 = -1
+        @Volatile var serverEmotion = "—"
+        @Volatile var serverActivityMode = "UNKNOWN"
+        @Volatile var serverMotionZ = 0f
+        @Volatile var serverZHr = 0f
 
         private const val MAX_IBI_ENTRIES = 200
         private const val IBI_RETENTION_MS = 120_000L
@@ -139,7 +169,8 @@ class SensorService : Service(), SensorEventListener {
         @Volatile var strictIbiFilter = false
         private const val MIN_IBI_FOR_HRV = 8
         private const val MIN_WINDOW_SEC_FOR_SIGNAL = 6.0
-        private const val MAX_ACC_MAGNITUDES = 64
+        private const val MAX_ACC_MAGNITUDES = 750  // ~25 Hz × 30 s
+        private const val EPOCH_IBI_MAX_MS = 60_000L
         private const val WAKE_LOCK_TIMEOUT_MS = 4 * 60 * 60 * 1000L
     }
 
@@ -149,6 +180,11 @@ class SensorService : Service(), SensorEventListener {
     private var displayOnLocal = true
     private val ibiWindow = ArrayDeque<IbiWindowEntry>(220)
     private val accMagnitudes = mutableListOf<Double>()
+    private val gyroMagnitudes = mutableListOf<Double>()
+    private val livePpgGreen = mutableListOf<Int>()
+    private val livePpgIr = mutableListOf<Int>()
+    private val livePpgRed = mutableListOf<Int>()
+    @Volatile private var lastSteps = 0f
     @Volatile private var lastIbiTimestampMs = 0L
 
     private val screenReceiver = object : BroadcastReceiver() {
@@ -176,6 +212,7 @@ class SensorService : Service(), SensorEventListener {
     private var sdkFlushLoopRunning = false
     private var hrFlushLoopRunning = false
     private var hrvPublishLoopRunning = false
+    private var liveWatchLoopRunning = false
     private var mqttPublishLoopRunning = false
     private var ppgBatchLoopRunning = false
 
@@ -224,6 +261,17 @@ class SensorService : Service(), SensorEventListener {
         }
     }
 
+    private val liveWatchRunnable = object : Runnable {
+        override fun run() {
+            if (!isRunning) {
+                liveWatchLoopRunning = false
+                return
+            }
+            publishWatchLive()
+            handler.postDelayed(this, LIVE_WATCH_INTERVAL_MS)
+        }
+    }
+
     private val mqttPublishRunnable = object : Runnable {
         override fun run() {
             if (!isRunning) {
@@ -241,7 +289,7 @@ class SensorService : Service(), SensorEventListener {
         displayOn = on
         if (leanMqtt) {
             hrvPublishIntervalMs = 30_000L
-            mqttPublishIntervalMs = 30_000L
+            mqttPublishIntervalMs = 1_000L
             hrFlushIntervalMs = if (on) 2_000L else 4_000L
         }
         Log.i(
@@ -326,6 +374,10 @@ class SensorService : Service(), SensorEventListener {
             // Prima epocă după 30s (fereastra HRV plină), nu la pornire goală
             handler.postDelayed(hrvPublishRunnable, hrvPublishIntervalMs)
         }
+        if (liveStreamEnabled && liveWatchEnabled && !liveWatchLoopRunning) {
+            liveWatchLoopRunning = true
+            handler.post(liveWatchRunnable)
+        }
         if (!mqttPublishLoopRunning) {
             mqttPublishLoopRunning = true
             handler.post(mqttPublishRunnable)
@@ -340,11 +392,13 @@ class SensorService : Service(), SensorEventListener {
         sdkFlushLoopRunning = false
         hrFlushLoopRunning = false
         hrvPublishLoopRunning = false
+        liveWatchLoopRunning = false
         mqttPublishLoopRunning = false
         ppgBatchLoopRunning = false
         handler.removeCallbacks(sdkFlushRunnable)
         handler.removeCallbacks(hrFlushRunnable)
         handler.removeCallbacks(hrvPublishRunnable)
+        handler.removeCallbacks(liveWatchRunnable)
         handler.removeCallbacks(mqttPublishRunnable)
         handler.removeCallbacks(ppgBatchRunnable)
     }
@@ -395,6 +449,7 @@ class SensorService : Service(), SensorEventListener {
 
                 if (status == 1 && hr > 0) {
                     lastHr = hr
+                    publishHrLive(hr, status)
                     enqueueSample(
                         hrSamples,
                         """{"ts":${dp.timestamp},"hr":$hr}"""
@@ -599,6 +654,14 @@ class SensorService : Service(), SensorEventListener {
                     isRunning = true
                     startAllTracking()
                 }
+            }
+            ACTION_RECALIBRATE -> {
+                if (isRunning && isMqttConnected) {
+                    requestProfileRecalibration()
+                } else {
+                    Log.w(TAG, "Recalibrare: tracking sau MQTT inactiv")
+                }
+                return START_STICKY
             }
             else -> {
                 // Restart automat START_STICKY (intent null) sau boot — reia tracking-ul
@@ -884,13 +947,27 @@ class SensorService : Service(), SensorEventListener {
     override fun onSensorChanged(event: SensorEvent) {
         val ts = System.currentTimeMillis()
         when (event.sensor.type) {
-            Sensor.TYPE_GYROSCOPE ->
+            Sensor.TYPE_GYROSCOPE -> {
+                val gMag = sqrt(
+                    event.values[0] * event.values[0] +
+                        event.values[1] * event.values[1] +
+                        event.values[2] * event.values[2]
+                ).toDouble()
+                synchronized(bufferLock) {
+                    gyroMagnitudes.add(gMag)
+                    while (gyroMagnitudes.size > MAX_ACC_MAGNITUDES) {
+                        gyroMagnitudes.removeAt(0)
+                    }
+                }
                 enqueueSample(
                     gyroSamples,
                     """{"ts":$ts,"gx":${event.values[0]},"gy":${event.values[1]},"gz":${event.values[2]}}"""
                 )
-            Sensor.TYPE_STEP_COUNTER ->
+            }
+            Sensor.TYPE_STEP_COUNTER -> {
+                lastSteps = event.values[0]
                 lastStepJson = """{"ts":$ts,"steps":${event.values[0]}}"""
+            }
         }
     }
 
@@ -926,21 +1003,27 @@ class SensorService : Service(), SensorEventListener {
                 }
 
                 override fun messageArrived(topic: String?, message: MqttMessage?) {
-                    if (topic != "biofizic/state" || message == null) return
+                    if (message == null || topic == null) return
                     try {
                         val json = message.payload.decodeToString()
-                        parseStateMessage(json)
+                        when (topic) {
+                            "biofizic/combined" -> parseCombinedMessage(json)
+                            "biofizic/state/live" -> parseStateLiveMessage(json)
+                            "biofizic/calibration/status" -> parseCalibrationStatus(json)
+                        }
                     } catch (e: Exception) {
-                        Log.w(TAG, "state parse: ${e.message}")
+                        Log.w(TAG, "MQTT parse $topic: ${e.message}")
                     }
                 }
 
                 override fun deliveryComplete(token: IMqttDeliveryToken?) {}
             })
             mqttClient.connect(options)
-            mqttClient.subscribe("biofizic/state", 0)
+            mqttClient.subscribe("biofizic/combined", 0)
+            mqttClient.subscribe("biofizic/state/live", 0)
+            mqttClient.subscribe("biofizic/calibration/status", 1)
             isMqttConnected = true
-            Log.i(TAG, "MQTT conectat la $BROKER_URL (+ subscribe biofizic/state)")
+            Log.i(TAG, "MQTT conectat la $BROKER_URL (+ combined, state/live)")
         } catch (e: Exception) {
             isMqttConnected = false
             Log.e(TAG, "MQTT eroare conectare: ${e.message}")
@@ -960,6 +1043,9 @@ class SensorService : Service(), SensorEventListener {
                 val g = dp.getValue(ValueKey.PpgSet.PPG_GREEN)
                 val ir = dp.getValue(ValueKey.PpgSet.PPG_IR)
                 val r = dp.getValue(ValueKey.PpgSet.PPG_RED)
+                livePpgGreen.add(g)
+                livePpgIr.add(ir)
+                livePpgRed.add(r)
                 ppgSamples.add("""{"ts":${dp.timestamp},"green":$g,"ir":$ir,"red":$r}""")
                 if (ppgStreamEnabled) {
                     val pub = System.currentTimeMillis()
@@ -969,7 +1055,9 @@ class SensorService : Service(), SensorEventListener {
                 }
             }
         }
-        // Acumulare batch PPG raw cu timestamps (pentru pipeline DSP extern)
+        // Acumulare batch PPG raw cu timestamps (pentru pipeline DSP extern).
+        // Flush imediat pe handler thread — nu asteapta timer-ul periodic.
+        var shouldFlush = false
         if (ppgRawEnabled) {
             synchronized(ppgBatchLock) {
                 for (dp in dataPoints) {
@@ -977,18 +1065,23 @@ class SensorService : Service(), SensorEventListener {
                     val ir = dp.getValue(ValueKey.PpgSet.PPG_IR)
                     ppgBatch.add(Triple(dp.timestamp, g, ir))
                 }
+                shouldFlush = ppgBatch.isNotEmpty()
             }
+        }
+        if (shouldFlush) {
+            handler.post { flushPpgBatch() }
         }
         for (payload in streamPayloads) {
             publish("biofizic/ppg/stream", payload)
         }
     }
 
+    // Safety valve: daca un batch e ramas neflushed (ex. enqueuePpg nu a mai fost apelat).
     private val ppgBatchRunnable = object : Runnable {
         override fun run() {
             if (!isRunning) return
             flushPpgBatch()
-            handler.postDelayed(this, ppgBatchSec * 1000L)
+            handler.postDelayed(this, 10_000L)  // safety la 10s, flush-ul real e imediat
         }
     }
 
@@ -1068,19 +1161,30 @@ class SensorService : Service(), SensorEventListener {
     private fun publishEpoch() {
         val ibiSnapshot: List<IbiWindowEntry>
         val accRms: Double
+        val accP90: Double
+        val accStd: Double
+        val gyroRms: Double
+        val gyroP90: Double
+        val gyroStd: Double
+        val ts = System.currentTimeMillis()
         synchronized(bufferLock) {
             trimIbiWindow()
-            ibiSnapshot = ibiWindow.toList()
-            accRms = if (accMagnitudes.isEmpty()) 0.0
-            else {
-                val dyn = accMagnitudes.map { abs(it - 9.81) }
-                sqrt(dyn.map { it * it }.average())
-            }
+            ibiSnapshot = ibiWindow.filter { it.ts >= ts - EPOCH_IBI_MAX_MS }
+            val accDyn = accMagnitudes.map { abs(it - 9.81) }
+            val (_, accP90Val, accStdVal) = magnitudeStats(accDyn)
+            accP90 = accP90Val
+            accStd = accStdVal
+            accRms = if (accDyn.isEmpty()) 0.0 else sqrt(accDyn.map { it * it }.average())
+            val (_, gyroP90Val, gyroStdVal) = magnitudeStats(gyroMagnitudes.toList())
+            gyroP90 = gyroP90Val
+            gyroStd = gyroStdVal
+            gyroRms = if (gyroMagnitudes.isEmpty()) 0.0
+            else sqrt(gyroMagnitudes.map { it * it }.average())
         }
-        val ts = System.currentTimeMillis()
         val secSinceIbi = if (lastIbiTimestampMs > 0) (ts - lastIbiTimestampMs) / 1000.0 else -1.0
         val features = HrvFeatureCalculator.compute(ibiSnapshot)
         val ibiMsJson = ibiSnapshot.joinToString(",") { it.ibiMs.toString() }
+        val ibiTsJson = ibiSnapshot.joinToString(",") { it.ts.toString() }
         val ibiN: Int
         val windowSec: Double
         val rmssd: Double
@@ -1118,13 +1222,8 @@ class SensorService : Service(), SensorEventListener {
             return
         }
         val payload =
-            """{"ts":$ts,"epoch_sec":$EPOCH_SEC,"displayOn":$displayOn,"bgSensors":$backgroundSensorsGranted,"hr":$lastHr,"ibi_n":$ibiN,"ibi_ms":[$ibiMsJson],"window_sec":${jsonFloat(windowSec, 1)},"sec_since_last_ibi":${jsonFloat(secSinceIbi, 1)},"hrv_ready":$hrvReady,"rmssd":${jsonFloat(rmssd, 2)},"sdnn":${jsonFloat(sdnn, 2)},"mean_ibi":${jsonFloat(meanIbi, 1)},"mean_hr":${jsonFloat(meanHr, 1)},"pnn50":${jsonFloat(pnn50, 1)},"acc_rms":${jsonFloat(accRms, 3)},"skin_temp":${jsonFloat(lastSkinTempC, 2)},"ambient_temp":${jsonFloat(lastAmbientTempC, 2)}}"""
+            """{"ts":$ts,"epoch_sec":$EPOCH_SEC,"displayOn":$displayOn,"bgSensors":$backgroundSensorsGranted,"hr":$lastHr,"ibi_n":$ibiN,"ibi_ms":[$ibiMsJson],"ibi_ts":[$ibiTsJson],"window_sec":${jsonFloat(windowSec, 1)},"sec_since_last_ibi":${jsonFloat(secSinceIbi, 1)},"hrv_ready":$hrvReady,"rmssd":${jsonFloat(rmssd, 2)},"sdnn":${jsonFloat(sdnn, 2)},"mean_ibi":${jsonFloat(meanIbi, 1)},"mean_hr":${jsonFloat(meanHr, 1)},"pnn50":${jsonFloat(pnn50, 1)},"acc_rms":${jsonFloat(accRms, 3)},"acc_p90":${jsonFloat(accP90, 3)},"acc_std":${jsonFloat(accStd, 3)},"gyro_rms":${jsonFloat(gyroRms, 4)},"gyro_p90":${jsonFloat(gyroP90, 4)},"gyro_std":${jsonFloat(gyroStd, 4)},"skin_temp":${jsonFloat(lastSkinTempC, 2)},"ambient_temp":${jsonFloat(lastAmbientTempC, 2)}}"""
         publish("biofizic/epoch", payload)
-        publish("biofizic/features", payload)
-        publish(
-            "biofizic/hrv",
-            """{"ts":$ts,"ibi_n":$ibiN,"window_sec":${jsonFloat(windowSec, 1)},"hrv_ready":$hrvReady,"rmssd":${jsonFloat(rmssd, 2)},"mean_hr":${jsonFloat(meanHr, 1)}}"""
-        )
         Log.i(
             TAG,
             "Epoch MQTT: ibi_n=$ibiN win=${"%.0f".format(windowSec)}s rmssd=${"%.1f".format(rmssd)} hr=$lastHr scr=${if (displayOn) "ON" else "OFF"}"
@@ -1206,23 +1305,51 @@ class SensorService : Service(), SensorEventListener {
         buffer.clear()
     }
 
-    private fun parseStateMessage(json: String) {
+    private fun requestProfileRecalibration() {
+        val ts = System.currentTimeMillis()
+        publish(
+            "biofizic/cmd/calibrate",
+            """{"ts":$ts,"action":"profile","source":"watch"}""",
+        )
+        calibrationPhase = "collecting"
+        calibrationMessage = "Recalibrare… profil vechi activ ~5 min"
+        Log.i(TAG, "Recalibrare profil trimisă pe MQTT")
+    }
+
+    private fun parseCalibrationStatus(json: String) {
         try {
             val obj = JSONObject(json)
-            if (!obj.has("arousal_10")) return
-            val a10 = obj.optInt("arousal_10", -1)
-            if (a10 < 0) return
-            lastStateMessageMs = System.currentTimeMillis()
-            arousal10 = a10.coerceIn(0, 10)
-            arousalConfidence = obj.optDouble("confidence", 0.0).toFloat()
-            val emotion = obj.optString("emotion", "")
-            emotionLabel = emotion.ifEmpty { "—" }
-            if (obj.has("motion_gated")) motionGated = obj.optBoolean("motion_gated")
-            if (obj.has("profile_ready")) profileReady = obj.optBoolean("profile_ready")
-            if (obj.has("signal_ok")) signalOk = obj.optBoolean("signal_ok")
-            if (obj.has("window_sec")) lastWindowSec = obj.optDouble("window_sec")
+            calibrationPhase = obj.optString("phase", "")
+            calibrationMessage = obj.optString("message", "")
+            if (obj.has("profile_ready")) {
+                profileReady = obj.optBoolean("profile_ready", profileReady)
+            }
+            if (calibrationPhase == "rejected") {
+                Log.w(TAG, "Recalibrare respinsă: $calibrationMessage")
+            }
         } catch (e: JSONException) {
-            Log.w(TAG, "parseStateMessage: ${e.message}")
+            Log.w(TAG, "parseCalibrationStatus: ${e.message}")
+        }
+    }
+
+    private fun parseCombinedMessage(json: String) {
+        try {
+            val obj = JSONObject(json)
+            val fused = obj.optDouble("arousal_fused", -1.0)
+            if (fused < 0) return
+            lastStateMessageMs = System.currentTimeMillis()
+            arousalFused = fused.toFloat().coerceIn(0f, 10f)
+            arousal10 = kotlin.math.round(arousalFused).toInt().coerceIn(0, 10)
+            arousalConfidence = obj.optDouble("confidence_fused", 0.0).toFloat()
+            emotionLabel = obj.optString("arousal_label", "—").ifEmpty { "—" }
+            profileReady = obj.optBoolean("profile_ready", profileReady)
+            val mode = obj.optString("activity_mode", "")
+            motionGated = obj.optBoolean("context_suppress_alert", false)
+                && mode == "LOCOMOTION"
+            val hrFromFusion = obj.optInt("hr", 0)
+            if (hrFromFusion > 0) lastHr = hrFromFusion
+        } catch (e: JSONException) {
+            Log.w(TAG, "parseCombinedMessage: ${e.message}")
         }
     }
 
@@ -1237,11 +1364,208 @@ class SensorService : Service(), SensorEventListener {
         }
     }
 
-    private fun publish(topic: String, payload: String) {
+    private fun parseStateLiveMessage(json: String) {
+        try {
+            val obj = JSONObject(json)
+            val a10 = obj.optInt("arousal_10", -1)
+            if (a10 >= 0) serverArousal10 = a10
+            serverEmotion = obj.optString("emotion", "—").ifEmpty { "—" }
+            serverActivityMode = obj.optString("activity_mode", "UNKNOWN").ifEmpty { "UNKNOWN" }
+            serverMotionZ = obj.optDouble("motion_z", 0.0).toFloat()
+            serverZHr = obj.optDouble("z_hr", 0.0).toFloat()
+            if (obj.has("profile_ready")) {
+                profileReady = obj.optBoolean("profile_ready", profileReady)
+            }
+        } catch (e: JSONException) {
+            Log.w(TAG, "parseStateLiveMessage: ${e.message}")
+        }
+    }
+
+    private fun publishWatchLive() {
+        if (!liveStreamEnabled || !liveWatchEnabled) return
+        val ts = System.currentTimeMillis()
+        val secSinceIbi = if (lastIbiTimestampMs > 0) (ts - lastIbiTimestampMs) / 1000.0 else -1.0
+
+        var accRms = 0.0
+        var accMag = 0.0
+        var gyroRms = 0.0
+        var ppgN = 0
+        var ppgGreenMean = 0.0
+        var ppgGreenStd = 0.0
+        var ppgIrMean = 0.0
+        var ppgRedMean = 0.0
+        var ibiN = 0
+        var rmssdLive = 0.0
+        var sdnnLive = 0.0
+        var meanHrLive = 0.0
+        var meanIbiLive = 0.0
+        var pnn50Live = 0.0
+        var windowSec = 0.0
+        var hrvReady = false
+
+        var accStd = 0.0
+        var gyroP90 = 0.0
+        var gyroStd = 0.0
+
+        synchronized(bufferLock) {
+            if (accMagnitudes.isNotEmpty()) {
+                val tail = accMagnitudes.takeLast(minOf(40, accMagnitudes.size))
+                val dyn = tail.map { abs(it - 9.81) }
+                accRms = sqrt(dyn.map { it * it }.average())
+                accMag = tail.average()
+                if (dyn.size > 1) {
+                    val mean = dyn.average()
+                    accStd = sqrt(dyn.map { (it - mean) * (it - mean) }.average())
+                }
+            }
+            if (gyroMagnitudes.isNotEmpty()) {
+                val tail = gyroMagnitudes.takeLast(minOf(40, gyroMagnitudes.size))
+                gyroRms = sqrt(tail.map { it * it }.average())
+                if (tail.isNotEmpty()) {
+                    val sorted = tail.sorted()
+                    gyroP90 = sorted[(sorted.size * 0.9).toInt().coerceAtMost(sorted.size - 1)]
+                }
+                if (tail.size > 1) {
+                    val mean = tail.average()
+                    gyroStd = sqrt(tail.map { (it - mean) * (it - mean) }.average())
+                }
+            }
+
+            ppgN = livePpgGreen.size
+            if (ppgN > 0) {
+                ppgGreenMean = livePpgGreen.map { it.toDouble() }.average()
+                ppgIrMean = livePpgIr.map { it.toDouble() }.average()
+                ppgRedMean = livePpgRed.map { it.toDouble() }.average()
+                if (ppgN > 1) {
+                    val varG = livePpgGreen.map { (it - ppgGreenMean) * (it - ppgGreenMean) }.average()
+                    ppgGreenStd = sqrt(varG)
+                }
+            }
+            livePpgGreen.clear()
+            livePpgIr.clear()
+            livePpgRed.clear()
+
+            ibiN = ibiWindow.size
+            val hrv = HrvFeatureCalculator.compute(ibiWindow.toList())
+            if (hrv != null) {
+                rmssdLive = hrv.rmssd
+                sdnnLive = hrv.sdnn
+                meanHrLive = hrv.meanHrBpm
+                meanIbiLive = hrv.meanIbiMs
+                pnn50Live = hrv.pnn50
+                windowSec = hrv.windowSec
+                lastRmssd = hrv.rmssd
+                lastWindowSec = hrv.windowSec
+                hrvReady = ibiN >= MIN_IBI_FOR_HRV && windowSec >= MIN_WINDOW_SEC_FOR_SIGNAL
+                signalOk = hrvReady
+            }
+        }
+
+        val arousalF = if (arousalFused >= 0f) jsonFloat(arousalFused.toDouble(), 2) else "null"
+        val arousal10Val = if (arousal10 >= 0) arousal10 else -1
+        val serverA10 = if (serverArousal10 >= 0) serverArousal10 else -1
+
+        val payload = buildString {
+            append("""{"ts":$ts,"live":true,"display_on":$displayOn,"mqtt_connected":$isMqttConnected,"hr":$lastHr,"hr_status":${if (lastHr > 0) 1 else 0},"acc_rms":${jsonFloat(accRms, 3)},"acc_mag":${jsonFloat(accMag, 3)},"gyro_rms":${jsonFloat(gyroRms, 4)},"skin_temp_c":${jsonFloat(lastSkinTempC, 2)},"ambient_temp_c":${jsonFloat(lastAmbientTempC, 2)},"ppg_n":$ppgN,"ppg_green_mean":${jsonFloat(ppgGreenMean, 1)},"ppg_green_std":${jsonFloat(ppgGreenStd, 1)},"ppg_ir_mean":${jsonFloat(ppgIrMean, 1)},"ppg_red_mean":${jsonFloat(ppgRedMean, 1)},"steps":${lastSteps.toInt()}""")
+            append(""","ibi_n":$ibiN,"ibi_window_sec":${jsonFloat(windowSec, 1)},"sec_since_ibi":${jsonFloat(secSinceIbi, 1)},"hrv_ready":$hrvReady,"rmssd_live":${jsonFloat(rmssdLive, 2)},"sdnn_live":${jsonFloat(sdnnLive, 2)},"mean_hr_live":${jsonFloat(meanHrLive, 1)},"mean_ibi_live":${jsonFloat(meanIbiLive, 1)},"pnn50_live":${jsonFloat(pnn50Live, 1)}""")
+            append(""","arousal_fused":$arousalF,"arousal_10":$arousal10Val,"confidence":${jsonFloat(arousalConfidence.toDouble(), 3)},"emotion":"${emotionLabel.replace("\"", "")}","profile_ready":$profileReady,"signal_ok":$signalOk""")
+            append(""","server_arousal_10":$serverA10,"server_emotion":"${serverEmotion.replace("\"", "")}","server_activity_mode":"${serverActivityMode.replace("\"", "")}","server_motion_z":${jsonFloat(serverMotionZ.toDouble(), 3)},"server_z_hr":${jsonFloat(serverZHr.toDouble(), 3)}}""")
+        }
+        publish("biofizic/watch/live", payload)
+        publishAcquisitionBatches(
+            ts = ts,
+            accRms = accRms,
+            accMag = accMag,
+            gyroRms = gyroRms,
+            accStd = accStd,
+            gyroP90 = gyroP90,
+            gyroStd = gyroStd,
+        )
+        // Compatibilitate pipeline existent
+        if (accRms > 0) {
+            publish(
+                "biofizic/acc/live",
+                """{"ts":$ts,"acc_rms":${jsonFloat(accRms, 3)},"sma_g":${jsonFloat(accRms, 3)}}"""
+            )
+        }
+    }
+
+    private fun publishAcquisitionBatches(
+        ts: Long,
+        accRms: Double,
+        accMag: Double,
+        gyroRms: Double,
+        accStd: Double,
+        gyroP90: Double,
+        gyroStd: Double,
+    ) {
+        publishIbiBatch(ts)
+        publishPpgBatch(ts)
+        val accP90 = accRms * 1.2
+        val payload = buildString {
+            append("""{"ts":$ts,"hr":$lastHr,"acc_rms":${jsonFloat(accRms, 3)},"acc_p90":${jsonFloat(accP90, 3)},"acc_std":${jsonFloat(accStd, 3)},"gyro_rms":${jsonFloat(gyroRms, 4)},"gyro_p90":${jsonFloat(gyroP90, 4)},"gyro_std":${jsonFloat(gyroStd, 4)},"skin_temp":${jsonFloat(lastSkinTempC, 2)},"ambient_temp":${jsonFloat(lastAmbientTempC, 2)},"displayOn":$displayOn}""")
+        }
+        publish("biofizic/sensors/batch", payload)
+    }
+
+    private fun publishIbiBatch(ts: Long) {
+        synchronized(bufferLock) {
+            val cutoff = ts - 1_000L
+            val recent = ibiWindow.filter { it.ts >= cutoff }
+            if (recent.isEmpty()) return
+            val ibiMs = recent.joinToString(",") { it.ibiMs.toString() }
+            val ibiTs = recent.joinToString(",") { it.ts.toString() }
+            publish("biofizic/ibi/batch", """{"ts":$ts,"ibi_ms":[$ibiMs],"ibi_ts":[$ibiTs]}""")
+        }
+    }
+
+    private fun publishPpgBatch(ts: Long) {
+        val snapshot: List<Triple<Long, Int, Int>>
+        synchronized(ppgBatchLock) {
+            val cutoff = ts - 1_000L
+            snapshot = ppgBatch.filter { it.first >= cutoff }
+        }
+        if (snapshot.isEmpty()) return
+        val tsArr = snapshot.joinToString(",") { it.first.toString() }
+        val gArr = snapshot.joinToString(",") { it.second.toString() }
+        val irArr = snapshot.joinToString(",") { it.third.toString() }
+        publish(
+            "biofizic/ppg/batch",
+            """{"ts":$ts,"ts_ms":[$tsArr],"green":[$gArr],"ir":[$irArr]}"""
+        )
+    }
+
+    private fun publishAccLive() {
+        if (!liveStreamEnabled) return
+        val rms: Double
+        synchronized(bufferLock) {
+            if (accMagnitudes.isEmpty()) return
+            val tail = accMagnitudes.takeLast(minOf(40, accMagnitudes.size))
+            val dyn = tail.map { kotlin.math.abs(it - 9.81) }
+            rms = kotlin.math.sqrt(dyn.map { it * it }.average())
+        }
+        val ts = System.currentTimeMillis()
+        publish(
+            "biofizic/acc/live",
+            """{"ts":$ts,"acc_rms":${jsonFloat(rms, 3)},"sma_g":${jsonFloat(rms, 3)}}"""
+        )
+    }
+
+    private fun publishHrLive(hr: Int, status: Int) {
+        if (!liveStreamEnabled || hr <= 0) return
+        val ts = System.currentTimeMillis()
+        publish(
+            "biofizic/hr/live",
+            """{"ts":$ts,"hr":$hr,"status":$status,"source":"samsung_sdk"}"""
+        )
+    }
+
+    private fun publish(topic: String, payload: String, retain: Boolean = false) {
         try {
             if (::mqttClient.isInitialized && mqttClient.isConnected) {
                 mqttClient.publish(topic, MqttMessage(payload.toByteArray()).apply {
-                    qos = 0  // fire-and-forget pentru date high-frequency
+                    qos = 0
+                    isRetained = retain
                 })
                 msgCount++
             }
@@ -1314,6 +1638,7 @@ class SensorService : Service(), SensorEventListener {
 
     private fun stopAllTracking() {
         isRunning = false
+        arousalFused = -1f
         arousal10 = -1
         arousalConfidence = 0f
         emotionLabel = "—"
@@ -1336,6 +1661,10 @@ class SensorService : Service(), SensorEventListener {
             ibiWindow.clear()
             lastIbiTimestampMs = 0L
             accMagnitudes.clear()
+            gyroMagnitudes.clear()
+            livePpgGreen.clear()
+            livePpgIr.clear()
+            livePpgRed.clear()
             lastStepJson = null
         }
         lastHrDataMs = 0L

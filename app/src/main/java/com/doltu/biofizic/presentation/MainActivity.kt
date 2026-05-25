@@ -17,6 +17,8 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -191,6 +193,7 @@ fun BiofizicWatchApp() {
     var isRunning by remember { mutableStateOf(SensorService.isRunning) }
     var mqttOk by remember { mutableStateOf(false) }
     var hr by remember { mutableIntStateOf(0) }
+    var arousalFused by remember { mutableFloatStateOf(-1f) }
     var arousal10 by remember { mutableIntStateOf(-1) }
     var emotion by remember { mutableStateOf("—") }
     var confidence by remember { mutableFloatStateOf(0f) }
@@ -198,6 +201,8 @@ fun BiofizicWatchApp() {
     var profileReady by remember { mutableStateOf(false) }
     var signalOk by remember { mutableStateOf(false) }
     var windowSec by remember { mutableFloatStateOf(0f) }
+    var calibrating by remember { mutableStateOf(false) }
+    var calMessage by remember { mutableStateOf("") }
 
     LaunchedEffect(Unit) {
         while (true) {
@@ -207,6 +212,7 @@ fun BiofizicWatchApp() {
             }
             mqttOk = SensorService.isMqttConnected
             hr = SensorService.lastHr
+            arousalFused = SensorService.arousalFused
             arousal10 = SensorService.arousal10
             emotion = SensorService.emotionLabel
             confidence = SensorService.arousalConfidence
@@ -214,6 +220,8 @@ fun BiofizicWatchApp() {
             profileReady = SensorService.profileReady
             signalOk = SensorService.signalOk
             windowSec = SensorService.lastWindowSec.toFloat()
+            calibrating = SensorService.calibrationPhase == "collecting"
+            calMessage = SensorService.calibrationMessage
             delay(400)
         }
     }
@@ -232,6 +240,7 @@ fun BiofizicWatchApp() {
                 isRunning = isRunning,
                 mqttOk = mqttOk,
                 hr = hr,
+                arousalFused = arousalFused,
                 arousal10 = arousal10,
                 emotion = emotion,
                 confidence = confidence,
@@ -239,8 +248,19 @@ fun BiofizicWatchApp() {
                 profileReady = profileReady,
                 signalOk = signalOk,
                 windowSec = windowSec,
+                calibrating = calibrating,
+                calMessage = calMessage,
                 contentWidth = contentW,
                 ringSize = ringSize,
+                onLongPressRecalibrate = {
+                    if (isRunning) {
+                        context.startForegroundService(
+                            Intent(context, SensorService::class.java).apply {
+                                action = SensorService.ACTION_RECALIBRATE
+                            },
+                        )
+                    }
+                },
                 modifier = Modifier
                     .width(contentW)
                     .align(Alignment.Center)
@@ -284,11 +304,13 @@ fun BiofizicWatchApp() {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun WatchFaceContent(
     isRunning: Boolean,
     mqttOk: Boolean,
     hr: Int,
+    arousalFused: Float,
     arousal10: Int,
     emotion: String,
     confidence: Float,
@@ -296,12 +318,15 @@ private fun WatchFaceContent(
     profileReady: Boolean,
     signalOk: Boolean,
     windowSec: Float,
+    calibrating: Boolean,
+    calMessage: String,
     contentWidth: Dp,
     ringSize: Dp,
+    onLongPressRecalibrate: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val hasArousal = isRunning && arousal10 in 0..10
-    val accent = arousalAccent(hasArousal, arousal10, motionGated, isRunning, mqttOk)
+    val hasVerdict = isRunning && arousalFused >= 0f
+    val accent = arousalAccent(hasVerdict, arousal10, motionGated, isRunning, mqttOk)
 
     Column(
         modifier = modifier.width(contentWidth),
@@ -310,20 +335,26 @@ private fun WatchFaceContent(
         CompactStatusLine(
             isRunning = isRunning,
             mqttOk = mqttOk,
-            profileReady = profileReady,
+            profileReady = profileReady && !calibrating,
             signalOk = signalOk,
+            calibrating = calibrating,
         )
 
         Spacer(modifier = Modifier.height(4.dp))
 
         Box(
             contentAlignment = Alignment.Center,
-            modifier = Modifier.size(ringSize),
+            modifier = Modifier
+                .size(ringSize)
+                .combinedClickable(
+                    onClick = {},
+                    onLongClick = onLongPressRecalibrate,
+                ),
         ) {
             ArousalGauge(
                 progress = when {
                     !isRunning -> 0f
-                    hasArousal -> arousal10 / 10f
+                    hasVerdict -> arousalFused / 10f
                     else -> 0f
                 },
                 accent = accent,
@@ -332,14 +363,14 @@ private fun WatchFaceContent(
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(
                     text = when {
-                        hasArousal -> "$arousal10"
+                        hasVerdict -> "%.1f".format(arousalFused)
                         isRunning && mqttOk -> "…"
                         isRunning -> "—"
                         else -> "○"
                     },
                     fontSize = 22.sp,
                     fontWeight = FontWeight.Bold,
-                    color = if (hasArousal || isRunning) TextPrimary else TextMuted,
+                    color = if (hasVerdict || isRunning) TextPrimary else TextMuted,
                     lineHeight = 22.sp,
                 )
                 Text(text = "/10", fontSize = 7.sp, color = TextMuted)
@@ -350,9 +381,9 @@ private fun WatchFaceContent(
 
         Text(
             text = when {
-                hasArousal -> emotion
+                calibrating && calMessage.isNotBlank() -> calMessage
+                hasVerdict -> emotion
                 isRunning && !mqttOk -> "Fără server"
-                isRunning && !profileReady -> "Calibrare profil"
                 isRunning -> "Se încarcă"
                 else -> "Gata"
             },
@@ -366,8 +397,8 @@ private fun WatchFaceContent(
 
         Text(
             text = metaLine(
-                isRunning, hasArousal, hr, confidence, motionGated,
-                profileReady, signalOk, windowSec,
+                isRunning, hasVerdict, hr, confidence, motionGated,
+                profileReady, signalOk, windowSec, calibrating,
             ),
             fontSize = 7.sp,
             color = TextMuted,
@@ -386,6 +417,7 @@ private fun CompactStatusLine(
     mqttOk: Boolean,
     profileReady: Boolean,
     signalOk: Boolean,
+    calibrating: Boolean = false,
 ) {
     val liveColor = when {
         !isRunning -> AccentIdle
@@ -406,6 +438,7 @@ private fun CompactStatusLine(
     val profLabel = when {
         !isRunning -> "Profil"
         !mqttOk -> "Profil-"
+        calibrating -> "Calibr…"
         profileReady -> "Profil OK"
         else -> "Profil…"
     }
@@ -514,20 +547,22 @@ private fun arousalAccent(
 
 private fun metaLine(
     isRunning: Boolean,
-    hasArousal: Boolean,
+    hasVerdict: Boolean,
     hr: Int,
     confidence: Float,
     motionGated: Boolean,
     profileReady: Boolean,
     signalOk: Boolean,
     windowSec: Float,
+    calibrating: Boolean = false,
 ): String = when {
-    !isRunning -> "Start · profil pe PC"
-    !profileReady -> "Calibrare 1-3 min"
+    calibrating -> "5 min repaus liniștit"
+    !isRunning -> "Start · ține apăsat gauge = recalibrare"
+    !hasVerdict -> "Aștept verdict fusion"
     !signalOk && windowSec > 0f -> "Fereastră ${windowSec.toInt()}s · min 10s"
     !signalOk -> "Aștept HRV"
     motionGated -> "Mișcare · ${hr}bpm"
-    hasArousal && hr > 0 -> "${(confidence * 100).toInt()}% · ${hr}bpm"
+    hasVerdict && hr > 0 -> "Conf ${(confidence * 100).toInt()}% · ${hr}bpm"
     hr > 0 -> "${hr}bpm"
     else -> "Aștept"
 }

@@ -25,7 +25,14 @@ object HrvFeatureCalculator {
     private const val MAX_IBI_TS_MISMATCH_MS = 250L
 
     fun compute(ibiEntries: List<IbiWindowEntry>): Features? {
-        val valid = ibiEntries.filter { it.ibiMs in MIN_IBI_MS..MAX_IBI_MS }
+        val physiological = ibiEntries.filter { it.ibiMs in MIN_IBI_MS..MAX_IBI_MS }
+        if (physiological.size < 2) return null
+
+        // Filtru median Oura-style: respinge IBI care se abate >20% de la mediana
+        // Previne artefacte rare (300ms sau 2000ms) care infleaza RMSSD cu sute de ms
+        val sorted = physiological.map { it.ibiMs }.sorted()
+        val median = sorted[sorted.size / 2].toDouble()
+        val valid = physiological.filter { kotlin.math.abs(it.ibiMs - median) < 0.20 * median }
         if (valid.size < 2) return null
 
         val mean = valid.map { it.ibiMs.toDouble() }.average()
