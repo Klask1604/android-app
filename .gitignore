@@ -1,15 +1,23 @@
 *.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+.gradle/
+/build/
+/captures/
+.externalNativeBuild/
+.cxx/
 local.properties
+
+# IDE
+.idea/
+*.swp
+.DS_Store
+
+# Kotlin / build cache
+.kotlin/
+
+# JVM crash logs
+*.log
+hs_err_pid*.log
+replay_pid*.log
+
+# Android Studio generated
+/app/build/
