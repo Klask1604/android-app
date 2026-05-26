@@ -486,28 +486,20 @@ private fun WatchFaceContent(
             contentAlignment = Alignment.Center,
         ) {
             if (calibrating) {
-                // While the profile calibrates there is no score yet: show a
-                // rotating loader + "Calibrare" instead of the empty "—".
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    CalibrationSpinner(accent = accent)
-                    Spacer(modifier = Modifier.height(4.dp))
+                // While the profile calibrates there is no score yet: one short
+                // row — "Calibrare" on the left, the rotating loader on the right
+                // — so it keeps the card height and does not push the buttons down.
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
                     Text(
                         text = "Calibrare",
-                        fontSize = 12.sp,
+                        fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = accent,
                     )
-                    if (calMessage.isNotBlank()) {
-                        Text(
-                            text = calMessage,
-                            fontSize = 8.sp,
-                            color = TextMuted,
-                            textAlign = TextAlign.Center,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.padding(top = 1.dp),
-                        )
-                    }
+                    CalibrationSpinner(accent = accent, size = 20.dp)
                 }
             } else {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {

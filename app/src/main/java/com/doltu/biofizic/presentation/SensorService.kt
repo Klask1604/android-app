@@ -96,6 +96,14 @@ class SensorService : Service(), SensorEventListener {
         // Pending self-report to send as a calibration once MQTT is connected.
         @Volatile var pendingReportedArousal: Double = Double.NaN
 
+        // When we last asked for a (re)calibration. Used to ignore the RETAINED
+        // "done" status that the broker replays on every (re)subscribe: any
+        // calibration/status whose ts predates our request is stale and must not
+        // clear the spinner. 0 = never asked (let the bootstrap message through).
+        @Volatile var calibrateRequestedAtMs: Long = 0L
+        // Skew margin (watch vs server clock) so a FRESH status is never dropped.
+        const val CALIBRATION_STALE_MARGIN_MS = 10_000L
+
         private val state = WatchStateRepository
 
         // Lifecycle / connectivity
@@ -996,6 +1004,7 @@ class SensorService : Service(), SensorEventListener {
 
     private fun requestProfileRecalibration(reportedArousal: Double = Double.NaN) {
         val ts = System.currentTimeMillis()
+        calibrateRequestedAtMs = ts  // anything older than this is stale/retained
         val reportedJson =
             if (reportedArousal.isNaN()) "" else ""","reported_arousal":$reportedArousal"""
         publish(
@@ -1019,6 +1028,16 @@ class SensorService : Service(), SensorEventListener {
     private fun parseCalibrationStatus(json: String) {
         try {
             val obj = JSONObject(json)
+            // Drop the broker's RETAINED "done" replayed on (re)subscribe: if its
+            // ts predates our recalibrate request (minus a skew margin), it is a
+            // stale message and must not clear the live spinner.
+            val msgTs = obj.optLong("ts", 0L)
+            if (calibrateRequestedAtMs > 0L &&
+                msgTs in 1 until (calibrateRequestedAtMs - CALIBRATION_STALE_MARGIN_MS)
+            ) {
+                Log.i(TAG, "Ignor status calibrare învechit (ts=$msgTs < cerere=$calibrateRequestedAtMs)")
+                return
+            }
             calibrationPhase = obj.optString("phase", "")
             calibrationMessage = obj.optString("message", "")
             if (obj.has("profile_ready")) {
