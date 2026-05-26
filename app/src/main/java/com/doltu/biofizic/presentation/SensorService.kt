@@ -15,10 +15,10 @@ import android.os.*
 import android.util.Log
 import com.doltu.biofizic.BuildConfig
 import com.doltu.biofizic.R
+import com.doltu.biofizic.acquisition.AcquisitionAssembler
 import com.doltu.biofizic.signal.HrvFeatureCalculator
 import com.doltu.biofizic.signal.IbiSignalFilter
 import com.doltu.biofizic.signal.IbiWindowEntry
-import com.doltu.biofizic.signal.TimedSample
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -41,7 +41,12 @@ import kotlin.math.sqrt
 
 class SensorService : Service(), SensorEventListener {
 
-    /** MQTT JSON must use Locale.US decimal point, not comma. */
+    // All per-stream buffers, atomic-sync helpers and the JSON build for
+    // acquisition/batch v2 live in AcquisitionAssembler. The Service only
+    // owns lifecycle, the Samsung SDK glue and the MQTT publish loop.
+    private val assembler = AcquisitionAssembler()
+
+    /** Format a double for log lines using a US decimal point. */
     private fun jsonFloat(value: Double, decimals: Int): String =
         String.format(Locale.US, "%.${decimals}f", value)
 
@@ -133,25 +138,17 @@ class SensorService : Service(), SensorEventListener {
             )
         }
 
-        private const val MAX_IBI_ENTRIES = 200
-        private const val IBI_RETENTION_MS = 120_000L
+        // Min beats and covered seconds required before the watch UI claims the
+        // signal is good. Server-side thresholds are stricter and authoritative;
+        // these only gate the local "signalOk" indicator.
         private const val MIN_IBI_FOR_HRV = 8
         private const val MIN_WINDOW_SEC_FOR_SIGNAL = 6.0
-        private const val MAX_ACC_MAGNITUDES = 750  // ~25 Hz × 30 s
         private const val WAKE_LOCK_TIMEOUT_MS = 4 * 60 * 60 * 1000L
     }
 
     private var accScaleLogRemaining = 5
     private var screenReceiverRegistered = false
     private var displayOnLocal = true
-    private val ibiWindow = ArrayDeque<IbiWindowEntry>(220)
-    /** IBI acceptate de la ultimul publish MQTT — evită golire la HR burst 4s vs publish 1s. */
-    private val ibiPendingPublish = ArrayDeque<IbiWindowEntry>(64)
-    private val accDynSamples = ArrayDeque<TimedSample>(800)
-    private val gyroDynSamples = ArrayDeque<TimedSample>(800)
-    @Volatile private var lastIbiTimestampMs = 0L
-    @Volatile private var lastSkinTempTsMs = 0L
-    private var acquisitionSeq = 0L
     private val timestampProbeEnabled = BuildConfig.DEBUG
     private var lastIbiSourceLogMs = 0L
 
@@ -163,12 +160,6 @@ class SensorService : Service(), SensorEventListener {
             }
         }
     }
-
-    private val bufferLock = Any()
-
-    // PPG samples are bundled into acquisition/batch v2 (one per second).
-    private val ppgBatchLock = Any()
-    private val ppgBatch = mutableListOf<Triple<Long, Int, Int>>()  // (ts_ms, green, ir)
 
     private var sdkFlushLoopRunning = false
     private var hrFlushLoopRunning = false
@@ -302,18 +293,17 @@ class SensorService : Service(), SensorEventListener {
         backgroundSensorsGranted = ContextCompat.checkSelfPermission(
             this, android.Manifest.permission.BODY_SENSORS_BACKGROUND
         ) == PackageManager.PERMISSION_GRANTED
-        synchronized(bufferLock) {
-            val liveHrv = HrvFeatureCalculator.compute(ibiWindow.toList())
-            val liveRmssd = liveHrv?.rmssd ?: 0.0
-            val liveWin = liveHrv?.windowSec ?: 0.0
-            val liveOk = ibiWindow.size >= MIN_IBI_FOR_HRV && liveWin >= MIN_WINDOW_SEC_FOR_SIGNAL
-            Log.i(
-                TAG,
-                "Status: ecran=${if (displayOn) "ON" else "OFF"}, bg=$backgroundSensorsGranted, " +
-                    "ibiWindow=${ibiWindow.size}, windowSec=${"%.0f".format(liveWin)}, " +
-                    "signalOk=$liveOk, rmssd=${"%.1f".format(liveRmssd)}, mqtt=$msgCount"
-            )
-        }
+        val snapshot = assembler.ibiWindowSnapshot()
+        val liveHrv = HrvFeatureCalculator.compute(snapshot)
+        val liveRmssd = liveHrv?.rmssd ?: 0.0
+        val liveWin = liveHrv?.windowSec ?: 0.0
+        val liveOk = snapshot.size >= MIN_IBI_FOR_HRV && liveWin >= MIN_WINDOW_SEC_FOR_SIGNAL
+        Log.i(
+            TAG,
+            "Status: screen=${if (displayOn) "ON" else "OFF"}, bg=$backgroundSensorsGranted, " +
+                "ibiWindow=${snapshot.size}, windowSec=${"%.0f".format(liveWin)}, " +
+                "signalOk=$liveOk, rmssd=${"%.1f".format(liveRmssd)}, mqtt=$msgCount"
+        )
     }
 
     private fun startPublishLoops() {
@@ -395,30 +385,27 @@ class SensorService : Service(), SensorEventListener {
                 val ibiList = dp.getValue(ValueKey.HeartRateSet.IBI_LIST)
                 val ibiStatusList = dp.getValue(ValueKey.HeartRateSet.IBI_STATUS_LIST)
                 if (ibiList != null && status == 1) {
-                    synchronized(bufferLock) {
-                        val hrForNorm = if (hr > 0) hr else lastHr
-                        // Filtrare
-                        val accepted = mutableListOf<Int>()
-                        for (i in ibiList.indices) {
-                            val norm = IbiSignalFilter.acceptBeat(
-                                ibiList[i],
-                                ibiStatusList?.getOrNull(i),
-                                hrForNorm,
-                            ) ?: continue
-                            accepted.add(norm)
+                    val hrForNorm = if (hr > 0) hr else lastHr
+                    val accepted = mutableListOf<Int>()
+                    for (i in ibiList.indices) {
+                        val norm = IbiSignalFilter.acceptBeat(
+                            ibiList[i],
+                            ibiStatusList?.getOrNull(i),
+                            hrForNorm,
+                        ) ?: continue
+                        accepted.add(norm)
+                    }
+                    if (accepted.isNotEmpty()) {
+                        val (timestamps, source) = assembler.buildIbiTimestamps(
+                            accepted, dp.timestamp, recvMs,
+                        )
+                        logIbiTimestampDecision(dp.timestamp, recvMs, source, accepted.size)
+                        val entries = ArrayList<IbiWindowEntry>(accepted.size)
+                        for (i in accepted.indices) {
+                            entries.add(IbiWindowEntry(accepted[i], timestamps[i], source))
                         }
-                        if (accepted.isNotEmpty()) {
-                            val (timestamps, source) = buildIbiTimestamps(accepted, dp.timestamp, recvMs)
-                            logIbiTimestampDecision(dp.timestamp, recvMs, source, accepted.size)
-                            for (i in accepted.indices) {
-                                val entry = IbiWindowEntry(accepted[i], timestamps[i], source)
-                                ibiWindow.addLast(entry)
-                                ibiPendingPublish.addLast(entry)
-                                batchIbi++
-                            }
-                            lastIbiTimestampMs = timestamps.last()
-                            trimIbiWindow()
-                        }
+                        assembler.addIbiBatch(entries)
+                        batchIbi += entries.size
                     }
                 }
             }
@@ -707,13 +694,13 @@ class SensorService : Service(), SensorEventListener {
             if (heartRateTracker != null) {
                 handler.post { heartRateTracker?.setEventListener(heartRateListener) }
                 ibiActive = true
-                lastIbiTimestampMs = System.currentTimeMillis()
+                assembler.markIbiTrackerStarted()
                 count++
-                Log.i(TAG, "✓ HR+IBI tracker pornit ($hrType)")
+                Log.i(TAG, "HR+IBI tracker started ($hrType)")
                 break
             }
         }
-        if (heartRateTracker == null) Log.w(TAG, "✗ Niciun tip HR accesibil")
+        if (heartRateTracker == null) Log.w(TAG, "No HR tracker type available")
 
         for (ppgMode in listOf(
             HealthTrackerType.PPG_CONTINUOUS,
@@ -764,7 +751,7 @@ class SensorService : Service(), SensorEventListener {
         Log.i(TAG, "Total senzori activi: $activeSensors")
         Log.i(
             TAG,
-            "MQTT: batch la ${mqttPublishIntervalMs}ms; ppg/raw=${if (ppgRawEnabled) "ON" else "OFF"}"
+            "MQTT: acquisition/batch at ${mqttPublishIntervalMs}ms"
         )
         startPublishLoops()
     }
@@ -780,11 +767,11 @@ class SensorService : Service(), SensorEventListener {
             heartRateTracker = tracker
             handler.post { heartRateTracker?.setEventListener(heartRateListener) }
             ibiActive = true
-            lastIbiTimestampMs = System.currentTimeMillis()
-            Log.i(TAG, "HR tracker restartat ($hrType)")
+            assembler.markIbiTrackerStarted()
+            Log.i(TAG, "HR tracker restarted ($hrType)")
             return
         }
-        Log.e(TAG, "HR tracker restart eșuat — retry în 10s")
+        Log.e(TAG, "HR tracker restart failed, retrying in 10s")
         handler.postDelayed({ if (isRunning) restartHrTracker() }, 10_000L)
     }
 
@@ -860,12 +847,7 @@ class SensorService : Service(), SensorEventListener {
                         event.values[1] * event.values[1] +
                         event.values[2] * event.values[2]
                 ).toDouble()
-                synchronized(bufferLock) {
-                    gyroDynSamples.addLast(TimedSample(ts, gMag))
-                    while (gyroDynSamples.size > MAX_ACC_MAGNITUDES) {
-                        gyroDynSamples.removeFirst()
-                    }
-                }
+                assembler.addGyroSample(ts, gMag)
             }
         }
     }
@@ -937,228 +919,90 @@ class SensorService : Service(), SensorEventListener {
 
 
     private fun enqueuePpg(dataPoints: List<DataPoint>) {
+        // Samples are kept in the assembler and bundled into acquisition/batch v2
+        // once per second by publishSensorBatches. No standalone publish on
+        // biofizic/ppg/raw any more (the server has no consumer for it).
         val recvMs = System.currentTimeMillis()
-        var shouldFlushRaw = false
-        synchronized(ppgBatchLock) {
-            for (dp in dataPoints) {
-                logTimestampProbe("PPG", dp.timestamp, recvMs)
-                val g = dp.getValue(ValueKey.PpgSet.PPG_GREEN)
-                val ir = dp.getValue(ValueKey.PpgSet.PPG_IR)
-                ppgBatch.add(Triple(dp.timestamp, g, ir))
-            }
-            shouldFlushRaw = ppgRawEnabled && ppgBatch.isNotEmpty()
+        for (dp in dataPoints) {
+            logTimestampProbe("PPG", dp.timestamp, recvMs)
+            val g = dp.getValue(ValueKey.PpgSet.PPG_GREEN)
+            val ir = dp.getValue(ValueKey.PpgSet.PPG_IR)
+            assembler.addPpgSample(dp.timestamp, g, ir)
         }
-        if (shouldFlushRaw) {
-            handler.post { flushPpgBatch() }
-        }
-    }
-
-    // Safety valve: daca un batch e ramas neflushed (ex. enqueuePpg nu a mai fost apelat).
-    private val ppgBatchRunnable = object : Runnable {
-        override fun run() {
-            if (!isRunning) return
-            flushPpgBatch()
-            handler.postDelayed(this, 10_000L)  // safety la 10s, flush-ul real e imediat
-        }
-    }
-
-    private fun flushPpgBatch() {
-        if (!ppgRawEnabled) return
-        val snapshot: List<Triple<Long, Int, Int>>
-        synchronized(ppgBatchLock) {
-            if (ppgBatch.isEmpty()) return
-            snapshot = ppgBatch.toList()
-            ppgBatch.clear()
-        }
-        val tsArr  = snapshot.joinToString(",") { it.first.toString() }
-        val gArr   = snapshot.joinToString(",") { it.second.toString() }
-        val irArr  = snapshot.joinToString(",") { it.third.toString() }
-        val payload = """{"ts_start":${snapshot.first().first},"fs":25,"n":${snapshot.size},"ts":[$tsArr],"green":[$gArr],"ir":[$irArr]}"""
-        publish("biofizic/ppg/raw", payload)
     }
 
     private fun enqueueSkinTemp(dataPoints: List<DataPoint>) {
-        synchronized(bufferLock) {
-            for (dp in dataPoints) {
-                val skin = dp.getValue(ValueKey.SkinTemperatureSet.OBJECT_TEMPERATURE)
-                val amb = dp.getValue(ValueKey.SkinTemperatureSet.AMBIENT_TEMPERATURE)
-                val status = dp.getValue(ValueKey.SkinTemperatureSet.STATUS)
-                if ((status == 0 || status == -1) && skin > 0) {
-                    lastSkinTempC = skin.toDouble()
-                    lastAmbientTempC = amb.toDouble()
-                    lastSkinTempTsMs = dp.timestamp
-                }
+        for (dp in dataPoints) {
+            val skin = dp.getValue(ValueKey.SkinTemperatureSet.OBJECT_TEMPERATURE)
+            val amb = dp.getValue(ValueKey.SkinTemperatureSet.AMBIENT_TEMPERATURE)
+            val status = dp.getValue(ValueKey.SkinTemperatureSet.STATUS)
+            if ((status == 0 || status == -1) && skin > 0) {
+                lastSkinTempC = skin.toDouble()
+                lastAmbientTempC = amb.toDouble()
+                assembler.lastSkinTempTsMs = dp.timestamp
             }
         }
     }
 
     private fun enqueueAcc(dataPoints: List<DataPoint>) {
         val recvMs = System.currentTimeMillis()
-        synchronized(bufferLock) {
-            for (dp in dataPoints) {
-                logTimestampProbe("ACC", dp.timestamp, recvMs)
-                val x = dp.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_X)
-                val y = dp.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_Y)
-                val z = dp.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_Z)
-                // Samsung LSM6DSV ±8g range, 16-bit; de verificat cu logcat la repaus:
-                // az_mps2 ar trebui ≈9.81, dacă nu ajustează scala (4096).
-                val xf = x.toDouble() / 4096.0 * 9.81
-                val yf = y.toDouble() / 4096.0 * 9.81
-                val zf = z.toDouble() / 4096.0 * 9.81
-                if (accScaleLogRemaining > 0) {
-                    Log.i(
-                        TAG,
-                        "ACC m/s² sample: ax=${jsonFloat(xf, 3)} ay=${jsonFloat(yf, 3)} az=${jsonFloat(zf, 3)} (raw x=$x y=$y z=$z)"
-                    )
-                    accScaleLogRemaining--
-                }
-                val mag = sqrt(xf * xf + yf * yf + zf * zf)
-                val dyn = abs(mag - 9.81)
-                accDynSamples.addLast(TimedSample(dp.timestamp, dyn))
-                while (accDynSamples.size > MAX_ACC_MAGNITUDES) {
-                    accDynSamples.removeFirst()
-                }
+        for (dp in dataPoints) {
+            logTimestampProbe("ACC", dp.timestamp, recvMs)
+            val x = dp.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_X)
+            val y = dp.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_Y)
+            val z = dp.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_Z)
+            // Samsung LSM6DSV at +/-8g range, 16-bit signed. 4096 LSB/g is the
+            // raw-to-g divisor; verify on a fresh device by leaving it flat and
+            // confirming az_mps2 ~ 9.81 in logcat.
+            val xf = x.toDouble() / 4096.0 * 9.81
+            val yf = y.toDouble() / 4096.0 * 9.81
+            val zf = z.toDouble() / 4096.0 * 9.81
+            if (accScaleLogRemaining > 0) {
+                Log.i(
+                    TAG,
+                    "ACC m/s^2 sample: ax=${jsonFloat(xf, 3)} ay=${jsonFloat(yf, 3)} az=${jsonFloat(zf, 3)} (raw x=$x y=$y z=$z)"
+                )
+                accScaleLogRemaining--
             }
+            val mag = sqrt(xf * xf + yf * yf + zf * zf)
+            val dyn = abs(mag - 9.81)
+            assembler.addAccSample(dp.timestamp, dyn)
         }
     }
 
     private fun logTimestampProbe(stream: String, dpTs: Long, recvMs: Long) {
-        val norm = normalizeSensorTimestampMs(dpTs)
+        val norm = assembler.normalizeSensorTimestampMs(dpTs)
         val skew = if (norm > 0L) recvMs - norm else -1L
         if (timestampProbeEnabled) {
             Log.d(TAG, "TS_PROBE $stream raw=$dpTs norm=$norm recv=$recvMs skew=$skew")
         }
-        if (stream == "PPG" && isEpochMillis(norm)) {
+        if (stream == "PPG" && assembler.isEpochMillis(norm)) {
             lastKnownSkewMs = skew
         }
     }
 
     private fun logIbiTimestampDecision(rawDpTs: Long, recvMs: Long, source: String, count: Int) {
-        val norm = normalizeSensorTimestampMs(rawDpTs)
+        val norm = assembler.normalizeSensorTimestampMs(rawDpTs)
         val skew = if (norm > 0L) recvMs - norm else -1L
         val now = System.currentTimeMillis()
         if (now - lastIbiSourceLogMs < 3_000L) return
         lastIbiSourceLogMs = now
         Log.i(
             TAG,
-            "IBI_TS source=$source count=$count rawDpTs=$rawDpTs normDpTs=$norm skewMs=$skew epoch=${isEpochMillis(norm)}",
+            "IBI_TS source=$source count=$count rawDpTs=$rawDpTs normDpTs=$norm skewMs=$skew epoch=${assembler.isEpochMillis(norm)}",
         )
     }
 
-    /** Samsung SDK: epoch ms; uneori ns sau 0 pe HR — normalizăm ce putem. */
-    private fun normalizeSensorTimestampMs(raw: Long): Long {
-        if (raw <= 0L) return 0L
-        if (raw > 1_000_000_000_000_000L) return raw / 1_000_000L
-        return raw
-    }
-
-    private fun isEpochMillis(ts: Long): Boolean = ts in 1_000_000_000_000L..2_500_000_000_000L
-
     @Volatile private var lastKnownSkewMs: Long? = null
 
-    private fun buildIbiTimestamps(
-        accepted: List<Int>,
-        dpTs: Long,
-        recvMs: Long,
-    ): Pair<LongArray, String> {
-        val normDp = normalizeSensorTimestampMs(dpTs)
-        val useDp = isEpochMillis(normDp)
-        val anchor = when {
-            useDp -> normDp
-            else -> recvMs
-        }
-        val source = if (useDp) "dp_timestamp" else "reconstructed"
-        val timestamps = LongArray(accepted.size)
-        var endTs = anchor
-        for (i in accepted.indices.reversed()) {
-            timestamps[i] = endTs
-            endTs -= accepted[i]
-        }
-        return Pair(timestamps, source)
-    }
-
-    /** IBI noi de la ultimul cadru MQTT (nu filtru 1s — HR vine la ~4s). */
-    private fun drainIbiForPublish(tsPublish: Long): List<IbiWindowEntry> {
-        synchronized(bufferLock) {
-            if (ibiPendingPublish.isNotEmpty()) {
-                val slice = ibiPendingPublish.toList()
-                ibiPendingPublish.clear()
-                return slice
-            }
-            val cutoff = tsPublish - 4_500L
-            return ibiWindow.filter { it.ts >= cutoff }
-        }
-    }
-
-    private data class MotionWindowStats(
-        val accRms: Double,
-        val accP90: Double,
-        val accStd: Double,
-        val gyroRms: Double,
-        val gyroP90: Double,
-        val gyroStd: Double,
-    )
-
-    private fun percentile90(values: List<Double>): Double {
-        if (values.isEmpty()) return 0.0
-        val sorted = values.sorted()
-        val idx = ((sorted.size - 1) * 0.9).toInt().coerceIn(0, sorted.lastIndex)
-        return sorted[idx]
-    }
-
-    private fun computeMotionStats(tsPublish: Long): MotionWindowStats {
-        val cutoff = tsPublish - 1_000L
-        synchronized(bufferLock) {
-            val accDyn = accDynSamples.filter { it.ts >= cutoff }.map { it.value }
-            val gyroVals = gyroDynSamples.filter { it.ts >= cutoff }.map { it.value }
-            val accRms = if (accDyn.isEmpty()) {
-                0.0
-            } else {
-                sqrt(accDyn.map { it * it }.average())
-            }
-            val accP90 = percentile90(accDyn)
-            val accStd = if (accDyn.size > 1) {
-                val mean = accDyn.average()
-                sqrt(accDyn.map { (it - mean) * (it - mean) }.average())
-            } else {
-                0.0
-            }
-            val gyroRms = if (gyroVals.isEmpty()) {
-                0.0
-            } else {
-                sqrt(gyroVals.map { it * it }.average())
-            }
-            val gyroP90 = percentile90(gyroVals)
-            val gyroStd = if (gyroVals.size > 1) {
-                val mean = gyroVals.average()
-                sqrt(gyroVals.map { (it - mean) * (it - mean) }.average())
-            } else {
-                0.0
-            }
-            return MotionWindowStats(accRms, accP90, accStd, gyroRms, gyroP90, gyroStd)
-        }
-    }
-
-    private fun trimIbiWindow() {
-        val cutoff = System.currentTimeMillis() - IBI_RETENTION_MS
-        while (ibiWindow.isNotEmpty() && ibiWindow.first().ts < cutoff) {
-            ibiWindow.removeFirst()
-        }
-        while (ibiWindow.size > MAX_IBI_ENTRIES) {
-            ibiWindow.removeFirst()
-        }
-    }
-
-    /** Extended HRV log at 30s (signalOk updated at 1 Hz in publishSensorBatches). */
+    /** Extended HRV log at 30 s; signalOk is updated at 1 Hz in publishSensorBatches. */
     private fun updateSignalStatus() {
-        synchronized(bufferLock) {
-            trimIbiWindow()
-            Log.i(
-                TAG,
-                "HRV extended: ibiWin=${ibiWindow.size} win=${"%.0f".format(lastWindowSec)}s " +
-                    "rmssd=${"%.1f".format(lastRmssd)} signalOk=$signalOk hr=$lastHr"
-            )
-        }
+        assembler.trimIbiWindow()
+        Log.i(
+            TAG,
+            "HRV extended: ibiWin=${assembler.ibiWindowSize()} win=${"%.0f".format(lastWindowSec)}s " +
+                "rmssd=${"%.1f".format(lastRmssd)} signalOk=$signalOk hr=$lastHr"
+        )
     }
 
     private fun logHrBatch(gapMs: Long, points: Int, ibiCount: Int) {
@@ -1167,7 +1011,7 @@ class SensorService : Service(), SensorEventListener {
         lastHrBatchLogMs = now
         Log.i(
             TAG,
-            "HR batch: gapMs=$gapMs points=$points ibi=$ibiCount buf=${ibiWindow.size} scr=${if (displayOn) "ON" else "OFF"}"
+            "HR batch: gapMs=$gapMs points=$points ibi=$ibiCount buf=${assembler.ibiWindowSize()} scr=${if (displayOn) "ON" else "OFF"}"
         )
     }
 
@@ -1177,20 +1021,18 @@ class SensorService : Service(), SensorEventListener {
         logHrBatch(gapMs, lastHrBatchPoints, lastHrBatchIbi)
     }
 
-    /** La fiecare 15s — vizibil în logcat chiar fără rafală Samsung. */
+    /** Heartbeat log every 15 s so logcat shows progress even without an SDK burst. */
     private fun logHrPulse() {
         val now = System.currentTimeMillis()
         if (now - lastHrPulseLogMs < 15_000L) return
         lastHrPulseLogMs = now
         val gapMs = if (lastHrDataMs > 0L) now - lastHrDataMs else -1L
         val trackerOk = heartRateTracker != null
-        synchronized(bufferLock) {
-            Log.i(
-                TAG,
-                "HR pulse: tracker=$trackerOk gapMs=$gapMs ibiWin=${ibiWindow.size} " +
-                    "lastHr=$lastHr scr=${if (displayOn) "ON" else "OFF"}"
-            )
-        }
+        Log.i(
+            TAG,
+            "HR pulse: tracker=$trackerOk gapMs=$gapMs ibiWin=${assembler.ibiWindowSize()} " +
+                "lastHr=$lastHr scr=${if (displayOn) "ON" else "OFF"}"
+        )
     }
 
     private fun requestProfileRecalibration() {
@@ -1273,81 +1115,37 @@ class SensorService : Service(), SensorEventListener {
     private fun publishSensorBatches() {
         if (!liveStreamEnabled || !liveWatchEnabled) return
         val tsPublish = System.currentTimeMillis()
-        val motion = computeMotionStats(tsPublish)
+        val motion = assembler.computeMotionStats(tsPublish)
 
-        synchronized(bufferLock) {
-            val hrv = HrvFeatureCalculator.compute(ibiWindow.toList())
-            if (hrv != null) {
-                lastRmssd = hrv.rmssd
-                lastWindowSec = hrv.windowSec
-                signalOk = ibiWindow.size >= MIN_IBI_FOR_HRV &&
-                    hrv.windowSec >= MIN_WINDOW_SEC_FOR_SIGNAL
-            }
+        val ibiSnapshot = assembler.ibiWindowSnapshot()
+        val hrv = HrvFeatureCalculator.compute(ibiSnapshot)
+        if (hrv != null) {
+            lastRmssd = hrv.rmssd
+            lastWindowSec = hrv.windowSec
+            signalOk = ibiSnapshot.size >= MIN_IBI_FOR_HRV &&
+                hrv.windowSec >= MIN_WINDOW_SEC_FOR_SIGNAL
         }
 
-        val ppgSnapshot = snapshotPpgWindow(tsPublish)
-        val ibiSlice = drainIbiForPublish(tsPublish)
-        publishAcquisitionBatchV2(tsPublish, motion, ppgSnapshot, ibiSlice)
-        syncUiState()
-    }
-
-    private fun snapshotPpgWindow(tsPublish: Long): List<Triple<Long, Int, Int>> {
-        synchronized(ppgBatchLock) {
-            val cutoff = tsPublish - 1_000L
-            val snap = ppgBatch.filter { it.first >= cutoff }
-            ppgBatch.removeAll { it.first >= cutoff }
-            return snap
-        }
-    }
-
-    private fun publishAcquisitionBatchV2(
-        tsPublish: Long,
-        motion: MotionWindowStats,
-        ppgSnapshot: List<Triple<Long, Int, Int>>,
-        ibiSlice: List<IbiWindowEntry>,
-    ) {
-        val ibiSource = ibiSlice.lastOrNull()?.tsSource ?: "reconstructed"
-        var tsAnchor = tsPublish
-        ibiSlice.maxOfOrNull { it.ts }?.let { tsAnchor = maxOf(tsAnchor, it) }
-        ppgSnapshot.maxOfOrNull { it.first }?.let { tsAnchor = maxOf(tsAnchor, it) }
-        if (lastSkinTempTsMs > 0L) {
-            tsAnchor = maxOf(tsAnchor, lastSkinTempTsMs)
-        }
-
-        acquisitionSeq++
-        val payload = buildString {
-            append(
-                """{"schema":2,"seq":$acquisitionSeq,"ts_publish":$tsPublish,"ts_anchor":$tsAnchor,"clock":"wall_ms"""",
-            )
-            append(""","hr":$lastHr,"display_on":$displayOn""")
-            append(""","skin_temp":${jsonFloat(lastSkinTempC, 2)},"skin_temp_ts":$lastSkinTempTsMs""")
-            append(""","ambient_temp":${jsonFloat(lastAmbientTempC, 2)}""")
-            append(
-                ""","motion":{"acc_rms":${jsonFloat(motion.accRms, 3)},"acc_p90":${jsonFloat(motion.accP90, 3)},"acc_std":${jsonFloat(motion.accStd, 3)},"gyro_rms":${jsonFloat(motion.gyroRms, 4)},"gyro_p90":${jsonFloat(motion.gyroP90, 4)},"gyro_std":${jsonFloat(motion.gyroStd, 4)},"window_ms":1000}""",
-            )
-            append(""","ibi":{"ms":[""")
-            append(ibiSlice.joinToString(",") { it.ibiMs.toString() })
-            append("],\"ts\":[")
-            append(ibiSlice.joinToString(",") { it.ts.toString() })
-            append("],\"source\":\"")
-            append(ibiSource)
-            append("\"}")
-            append(""","ppg":{"ts_ms":[""")
-            append(ppgSnapshot.joinToString(",") { it.first.toString() })
-            append("],\"green\":[")
-            append(ppgSnapshot.joinToString(",") { it.second.toString() })
-            append("],\"ir\":[")
-            append(ppgSnapshot.joinToString(",") { it.third.toString() })
-            append("]}")
-            append("}")
-        }
-        publish("biofizic/acquisition/batch", payload)
-        if (ibiSlice.isNotEmpty() || ppgSnapshot.isNotEmpty()) {
+        val ppgSnapshot = assembler.snapshotPpgWindow(tsPublish)
+        val ibiSlice = assembler.drainIbiForPublish(tsPublish)
+        val payload = assembler.buildAcquisitionPayload(
+            tsPublish = tsPublish,
+            motion = motion,
+            ppgSnapshot = ppgSnapshot,
+            ibiSlice = ibiSlice,
+            heartRateBpm = lastHr,
+            displayOn = displayOn,
+            skinTempC = lastSkinTempC,
+            ambientTempC = lastAmbientTempC,
+        )
+        publish("biofizic/acquisition/batch", payload.json)
+        if (payload.ibiCount > 0 || payload.ppgCount > 0) {
             Log.i(
                 TAG,
-                "acquisition seq=$acquisitionSeq ibi=${ibiSlice.size} source=$ibiSource ppg=${ppgSnapshot.size}",
+                "acquisition seq=${payload.sequence} ibi=${payload.ibiCount} source=${payload.ibiSource} ppg=${payload.ppgCount}",
             )
         }
+        syncUiState()
     }
 
     private fun publish(topic: String, payload: String, retain: Boolean = false) {
@@ -1396,10 +1194,10 @@ class SensorService : Service(), SensorEventListener {
                     }
                 }
 
-                if (lastIbiTimestampMs > 0 && isRunning) {
-                    val ibiStaleSec = (System.currentTimeMillis() - lastIbiTimestampMs) / 1000
+                if (assembler.lastIbiTimestampMs > 0 && isRunning) {
+                    val ibiStaleSec = (System.currentTimeMillis() - assembler.lastIbiTimestampMs) / 1000
                     if (ibiStaleSec > 45L && heartRateTracker != null) {
-                        Log.w(TAG, "HR tracker inactiv de ${ibiStaleSec}s — restart forțat")
+                        Log.w(TAG, "HR tracker idle for ${ibiStaleSec}s, forcing restart")
                         handler.post {
                             heartRateTracker?.unsetEventListener()
                             heartRateTracker = null
@@ -1431,7 +1229,7 @@ class SensorService : Service(), SensorEventListener {
         arousalFused = -1f
         arousal10 = -1
         arousalConfidence = 0f
-        arousalLabel = "—"
+        arousalLabel = "-"
         motionGated = false
         profileReady = false
         signalOk = false
@@ -1439,16 +1237,7 @@ class SensorService : Service(), SensorEventListener {
         stopPublishLoops()
         updateSignalStatus()
         unregisterScreenReceiver()
-        synchronized(bufferLock) {
-            ibiWindow.clear()
-            ibiPendingPublish.clear()
-            lastIbiTimestampMs = 0L
-            accDynSamples.clear()
-            gyroDynSamples.clear()
-        }
-        synchronized(ppgBatchLock) {
-            ppgBatch.clear()
-        }
+        assembler.clear()
         lastHrDataMs = 0L
         lastHrBatchPoints = 0
         lastHrBatchIbi = 0
@@ -1478,7 +1267,6 @@ class SensorService : Service(), SensorEventListener {
         activeSensors = 0
         lastHr = 0
         msgCount = 0
-        acquisitionSeq = 0L
         syncUiState()
     }
 

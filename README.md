@@ -59,9 +59,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 | `biofizic/state` | Retained 30 s epoch decision; arrives immediately on reconnect as bootstrap |
 | `biofizic/calibration/status` | Baseline recalibration feedback |
 
-Optional dev publish: set `ppgRawEnabled = true` in `SensorService` companion for `biofizic/ppg/raw`.
-
-Recalibrate personal baseline: long-press the arousal gauge → sends `biofizic/cmd/calibrate`.
+Recalibrate the personal baseline by long-pressing the arousal gauge on the watch. That sends `biofizic/cmd/calibrate`.
 
 ## Local HRV on watch (not used for decisions)
 
