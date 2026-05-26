@@ -11,9 +11,9 @@ import org.junit.jupiter.api.Test
  * Unit tests for atomic-sync logic in AcquisitionAssembler.
  *
  * These pin the contract that makes server-side HRV math correct: every
- * acquisition/batch v2 payload bundles IBI, PPG, motion and skin temperature
- * referenced to a single ts_anchor, with per-beat IBI timestamps reconstructed
- * walking backwards from that anchor.
+ * acquisition/batch v2 payload bundles IBI, motion stats, cardiac-band motion
+ * energy and skin temperature referenced to a single ts_anchor, with per-beat
+ * IBI timestamps reconstructed walking backwards from that anchor.
  */
 class AcquisitionAssemblerTest {
 
@@ -92,18 +92,17 @@ class AcquisitionAssemblerTest {
     // -----------------------------------------------------------------------
 
     @Test
-    fun `ts_anchor is the max of ts_publish, IBI, PPG and skin temp`() {
+    fun `ts_anchor is the max of ts_publish, IBI and skin temp`() {
         val a = assembler()
         val tsPublish = 1_716_000_010_000L
         val ibiTs = 1_716_000_010_400L  // newer than publish
-        val ppgTs = 1_716_000_010_200L
         val skinTs = 1_716_000_010_700L  // newest of all
         a.lastSkinTempTsMs = skinTs
 
         val payload = a.buildAcquisitionPayload(
             tsPublish = tsPublish,
             motion = zeroMotion(),
-            ppgSnapshot = listOf(Triple(ppgTs, 1000, 500)),
+            accBandCardiac = 0.0,
             ibiSlice = listOf(IbiWindowEntry(820, ibiTs, "dp_timestamp")),
             heartRateBpm = 72,
             displayOn = true,
@@ -122,7 +121,7 @@ class AcquisitionAssemblerTest {
         val payload = a.buildAcquisitionPayload(
             tsPublish = tsPublish,
             motion = zeroMotion(),
-            ppgSnapshot = emptyList(),
+            accBandCardiac = 0.0,
             ibiSlice = emptyList(),
             heartRateBpm = 72,
             displayOn = true,
@@ -135,17 +134,30 @@ class AcquisitionAssemblerTest {
     }
 
     @Test
+    fun `acquisition payload carries acc_band_cardiac in the motion block`() {
+        val a = assembler()
+        val payload = a.buildAcquisitionPayload(
+            tsPublish = 1L, motion = zeroMotion(),
+            accBandCardiac = 0.1234, ibiSlice = emptyList(),
+            heartRateBpm = 70, displayOn = true,
+            skinTempC = 0.0, ambientTempC = 0.0,
+        )
+        assertTrue(payload.json.contains("\"acc_band_cardiac\":0.1234"))
+        assertTrue(!payload.json.contains("\"ppg\""))
+    }
+
+    @Test
     fun `acquisition payload sequence increments on every call`() {
         val a = assembler()
         val first = a.buildAcquisitionPayload(
             tsPublish = 1L, motion = zeroMotion(),
-            ppgSnapshot = emptyList(), ibiSlice = emptyList(),
+            accBandCardiac = 0.0, ibiSlice = emptyList(),
             heartRateBpm = 70, displayOn = true,
             skinTempC = 0.0, ambientTempC = 0.0,
         )
         val second = a.buildAcquisitionPayload(
             tsPublish = 2L, motion = zeroMotion(),
-            ppgSnapshot = emptyList(), ibiSlice = emptyList(),
+            accBandCardiac = 0.0, ibiSlice = emptyList(),
             heartRateBpm = 70, displayOn = true,
             skinTempC = 0.0, ambientTempC = 0.0,
         )
@@ -233,12 +245,11 @@ class AcquisitionAssemblerTest {
         a.addIbiBatch(listOf(IbiWindowEntry(800, now, "dp_timestamp")))
         a.addAccSample(now, 0.4)
         a.addGyroSample(now, 0.1)
-        a.addPpgSample(now, 1000, 500)
         a.lastSkinTempTsMs = now
         // Force a payload build to advance the sequence past zero.
         a.buildAcquisitionPayload(
             tsPublish = now, motion = zeroMotion(),
-            ppgSnapshot = emptyList(), ibiSlice = emptyList(),
+            accBandCardiac = 0.0, ibiSlice = emptyList(),
             heartRateBpm = 70, displayOn = true,
             skinTempC = 0.0, ambientTempC = 0.0,
         )
@@ -249,18 +260,49 @@ class AcquisitionAssemblerTest {
         assertEquals(0L, a.lastIbiTimestampMs)
         assertEquals(0L, a.lastSkinTempTsMs)
         assertTrue(a.drainIbiForPublish(now).isEmpty())
-        assertTrue(a.snapshotPpgWindow(now).isEmpty())
         val stats = a.computeMotionStats(now)
         assertEquals(0.0, stats.accRms, 1e-9)
         assertEquals(0.0, stats.gyroRms, 1e-9)
         // First payload after clear must restart sequence numbering at 1.
         val first = a.buildAcquisitionPayload(
             tsPublish = now, motion = zeroMotion(),
-            ppgSnapshot = emptyList(), ibiSlice = emptyList(),
+            accBandCardiac = 0.0, ibiSlice = emptyList(),
             heartRateBpm = 70, displayOn = true,
             skinTempC = 0.0, ambientTempC = 0.0,
         )
         assertEquals(1L, first.sequence)
+    }
+
+    // -----------------------------------------------------------------------
+    // Cardiac-band motion energy (0.5-4 Hz)
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `cardiac band energy is zero below the minimum sample count`() {
+        val a = assembler()
+        val now = 1_716_000_070_000L
+        // Only a handful of samples in the window: not enough to estimate.
+        for (i in 0 until 10) a.addAccSample(now - i * 40L, 1.0)
+        assertEquals(0.0, a.computeCardiacBandEnergy(now), 1e-12)
+    }
+
+    @Test
+    fun `cardiac band energy rises for in-band motion vs a still wrist`() {
+        val still = assembler()
+        val moving = assembler()
+        val now = 1_716_000_080_000L
+        val fs = 25.0
+        val n = 200                       // 8 s at 25 Hz
+        for (i in 0 until n) {
+            val ts = now - ((n - 1 - i) * 1000L / fs.toLong())
+            still.addAccSample(ts, 0.0)   // perfectly still
+            // 1.5 Hz oscillation -> energy inside the 0.5-4 Hz band
+            val v = kotlin.math.sin(2.0 * Math.PI * 1.5 * i / fs)
+            moving.addAccSample(ts, v)
+        }
+        val stillEnergy = still.computeCardiacBandEnergy(now)
+        val movingEnergy = moving.computeCardiacBandEnergy(now)
+        assertTrue(movingEnergy > stillEnergy, "in-band motion must raise cardiac-band energy")
     }
 
     private fun zeroMotion(): AcquisitionAssembler.MotionWindowStats =

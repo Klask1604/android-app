@@ -3,6 +3,11 @@ package com.doltu.biofizic.acquisition
 import com.doltu.biofizic.signal.IbiWindowEntry
 import com.doltu.biofizic.signal.TimedSample
 import java.util.Locale
+import kotlin.math.PI
+import kotlin.math.ceil
+import kotlin.math.cos
+import kotlin.math.floor
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
@@ -39,6 +44,23 @@ class AcquisitionAssembler(
     private val publishHorizonMs: Long = 4_500L,
 ) {
 
+    companion object {
+        // Cardiac-band acceleration energy: the part of wrist motion (0.5-4 Hz)
+        // that overlaps and corrupts the PPG pulse. Sent as the single scalar
+        // acc_band_cardiac and consumed by the server's signal-quality gate.
+        // An 8 s window gives ~0.125 Hz resolution, enough to resolve 0.5 Hz.
+        private const val CARDIAC_BAND_WINDOW_MS = 8_000L
+        private const val CARDIAC_BAND_MIN_SAMPLES = 40
+        private const val CARDIAC_BAND_LO_HZ = 0.5
+        private const val CARDIAC_BAND_HI_HZ = 4.0
+
+        // Research toggle: include the raw PPG arrays (green/ir/ts) in the
+        // acquisition payload for the server's legacy peak-detection demos.
+        // Off by default — raw PPG has no production consumer and costs
+        // bandwidth. Flip and rebuild together with ENABLE_RAW_PPG on the server.
+        const val PUBLISH_RAW_PPG = false
+    }
+
     /** Snapshot of motion stats computed over the last 1 s wall-clock window. */
     data class MotionWindowStats(
         val accRms: Double,
@@ -51,6 +73,7 @@ class AcquisitionAssembler(
 
     private val bufferLock = Any()
     private val ppgBatchLock = Any()
+    private val ppgBatch = mutableListOf<Triple<Long, Int, Int>>()  // (ts_ms, green, ir)
 
     private val ibiWindow = ArrayDeque<IbiWindowEntry>(220)
     // IBI accepted since the previous publish. HR ships in ~4 s bursts and we
@@ -59,7 +82,6 @@ class AcquisitionAssembler(
     private val ibiPendingPublish = ArrayDeque<IbiWindowEntry>(64)
     private val accDynSamples = ArrayDeque<TimedSample>(maxMotionSamples)
     private val gyroDynSamples = ArrayDeque<TimedSample>(maxMotionSamples)
-    private val ppgBatch = mutableListOf<Triple<Long, Int, Int>>()  // (ts_ms, green, ir)
 
     @Volatile var lastIbiTimestampMs: Long = 0L
         private set
@@ -106,8 +128,19 @@ class AcquisitionAssembler(
         }
     }
 
+    /** Buffer one raw PPG sample (research only; gated by PUBLISH_RAW_PPG). */
     fun addPpgSample(ts: Long, green: Int, ir: Int) {
         synchronized(ppgBatchLock) { ppgBatch.add(Triple(ts, green, ir)) }
+    }
+
+    /** Drain the last 1 s of buffered PPG samples for the current batch. */
+    fun snapshotPpgWindow(tsPublish: Long): List<Triple<Long, Int, Int>> {
+        synchronized(ppgBatchLock) {
+            val cutoff = tsPublish - 1_000L
+            val snap = ppgBatch.filter { it.first >= cutoff }
+            ppgBatch.removeAll { it.first >= cutoff }
+            return snap
+        }
     }
 
     /** Drop everything. Called on stop and on baseline recalibration. */
@@ -182,14 +215,47 @@ class AcquisitionAssembler(
         }
     }
 
-    /** Snapshot the last 1 s of PPG samples for the current acquisition batch. */
-    fun snapshotPpgWindow(tsPublish: Long): List<Triple<Long, Int, Int>> {
-        synchronized(ppgBatchLock) {
-            val cutoff = tsPublish - 1_000L
-            val snap = ppgBatch.filter { it.first >= cutoff }
-            ppgBatch.removeAll { it.first >= cutoff }
-            return snap
+    /**
+     * Cardiac-band (0.5-4 Hz) energy of the dynamic acceleration over the last
+     * CARDIAC_BAND_WINDOW_MS. This is the motion that overlaps the PPG pulse and
+     * therefore predicts optical artifacts; the server's signal-quality gate
+     * uses it instead of an inferred activity class. Computed with a direct DFT
+     * band sum (no FFT dependency); the band power is normalised per sample so
+     * the scale is independent of how many samples landed in the window.
+     */
+    fun computeCardiacBandEnergy(tsPublish: Long): Double {
+        val cutoff = tsPublish - CARDIAC_BAND_WINDOW_MS
+        val samples = synchronized(bufferLock) {
+            accDynSamples.filter { it.ts >= cutoff }
         }
+        val n = samples.size
+        if (n < CARDIAC_BAND_MIN_SAMPLES) return 0.0
+
+        val durSec = (samples.last().ts - samples.first().ts) / 1000.0
+        if (durSec <= 0.0) return 0.0
+        val fs = (n - 1) / durSec          // effective sample rate from timestamps
+        val df = fs / n                    // frequency resolution
+        if (df <= 0.0) return 0.0
+
+        val mean = samples.map { it.value }.average()
+        val centered = DoubleArray(n) { samples[it].value - mean }
+
+        val kLo = maxOf(1, ceil(CARDIAC_BAND_LO_HZ / df).toInt())
+        val kHi = minOf(n / 2, floor(CARDIAC_BAND_HI_HZ / df).toInt())
+        if (kHi < kLo) return 0.0
+
+        var energy = 0.0
+        for (k in kLo..kHi) {
+            var re = 0.0
+            var im = 0.0
+            val w = 2.0 * PI * k / n
+            for (i in 0 until n) {
+                re += centered[i] * cos(w * i)
+                im -= centered[i] * sin(w * i)
+            }
+            energy += re * re + im * im
+        }
+        return energy / (n.toDouble() * n.toDouble())
     }
 
     /** Motion stats over the last 1 s wall-clock window. */
@@ -242,17 +308,20 @@ class AcquisitionAssembler(
     fun buildAcquisitionPayload(
         tsPublish: Long,
         motion: MotionWindowStats,
-        ppgSnapshot: List<Triple<Long, Int, Int>>,
+        accBandCardiac: Double,
         ibiSlice: List<IbiWindowEntry>,
         heartRateBpm: Int,
         displayOn: Boolean,
         skinTempC: Double,
         ambientTempC: Double,
+        ppgSnapshot: List<Triple<Long, Int, Int>> = emptyList(),
     ): AcquisitionPayload {
         val ibiSource = ibiSlice.lastOrNull()?.tsSource ?: "reconstructed"
         var tsAnchor = tsPublish
         ibiSlice.maxOfOrNull { it.ts }?.let { tsAnchor = maxOf(tsAnchor, it) }
-        ppgSnapshot.maxOfOrNull { it.first }?.let { tsAnchor = maxOf(tsAnchor, it) }
+        if (PUBLISH_RAW_PPG) {
+            ppgSnapshot.maxOfOrNull { it.first }?.let { tsAnchor = maxOf(tsAnchor, it) }
+        }
         if (lastSkinTempTsMs > 0L) {
             tsAnchor = maxOf(tsAnchor, lastSkinTempTsMs)
         }
@@ -266,7 +335,7 @@ class AcquisitionAssembler(
             append(""","skin_temp":${jsonFloat(skinTempC, 2)},"skin_temp_ts":$lastSkinTempTsMs""")
             append(""","ambient_temp":${jsonFloat(ambientTempC, 2)}""")
             append(
-                ""","motion":{"acc_rms":${jsonFloat(motion.accRms, 3)},"acc_p90":${jsonFloat(motion.accP90, 3)},"acc_std":${jsonFloat(motion.accStd, 3)},"gyro_rms":${jsonFloat(motion.gyroRms, 4)},"gyro_p90":${jsonFloat(motion.gyroP90, 4)},"gyro_std":${jsonFloat(motion.gyroStd, 4)},"window_ms":1000}"""
+                ""","motion":{"acc_rms":${jsonFloat(motion.accRms, 3)},"acc_p90":${jsonFloat(motion.accP90, 3)},"acc_std":${jsonFloat(motion.accStd, 3)},"gyro_rms":${jsonFloat(motion.gyroRms, 4)},"gyro_p90":${jsonFloat(motion.gyroP90, 4)},"gyro_std":${jsonFloat(motion.gyroStd, 4)},"acc_band_cardiac":${jsonFloat(accBandCardiac, 4)},"window_ms":1000}"""
             )
             append(""","ibi":{"ms":[""")
             append(ibiSlice.joinToString(",") { it.ibiMs.toString() })
@@ -275,13 +344,15 @@ class AcquisitionAssembler(
             append("],\"source\":\"")
             append(ibiSource)
             append("\"}")
-            append(""","ppg":{"ts_ms":[""")
-            append(ppgSnapshot.joinToString(",") { it.first.toString() })
-            append("],\"green\":[")
-            append(ppgSnapshot.joinToString(",") { it.second.toString() })
-            append("],\"ir\":[")
-            append(ppgSnapshot.joinToString(",") { it.third.toString() })
-            append("]}")
+            if (PUBLISH_RAW_PPG && ppgSnapshot.isNotEmpty()) {
+                append(""","ppg":{"ts_ms":[""")
+                append(ppgSnapshot.joinToString(",") { it.first.toString() })
+                append("],\"green\":[")
+                append(ppgSnapshot.joinToString(",") { it.second.toString() })
+                append("],\"ir\":[")
+                append(ppgSnapshot.joinToString(",") { it.third.toString() })
+                append("]}")
+            }
             append("}")
         }
         return AcquisitionPayload(

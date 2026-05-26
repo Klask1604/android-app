@@ -19,6 +19,8 @@ data class TimedSample(val ts: Long, val value: Double)
  */
 object IbiSignalFilter {
 
+    // MUST stay in sync with the server: biofizic/config.py
+    // MIN/MAX_INTERBEAT_INTERVAL_MS. Both ends filter the same physiological band.
     const val MIN_IBI_MS = 300
     const val MAX_IBI_MS = 2_000
 
@@ -69,7 +71,12 @@ object HrvFeatureCalculator {
 
     private const val MIN_IBI_MS = IbiSignalFilter.MIN_IBI_MS
     private const val MAX_IBI_MS = IbiSignalFilter.MAX_IBI_MS
+    // Cross-codebase constants — keep equal to biofizic/config.py:
+    //   MAX_IBI_TS_MISMATCH_MS  <- MAX_TIMESTAMP_IBI_MISMATCH_MS
+    //   OUTLIER_MEDIAN_DEVIATION_RATIO, PNN50_THRESHOLD_MS
     private const val MAX_IBI_TS_MISMATCH_MS = 250L
+    private const val OUTLIER_MEDIAN_DEVIATION_RATIO = 0.20
+    private const val PNN50_THRESHOLD_MS = 50.0
 
     fun compute(ibiEntries: List<IbiWindowEntry>): Features? {
         val physiological = ibiEntries.filter { it.ibiMs in MIN_IBI_MS..MAX_IBI_MS }
@@ -77,7 +84,9 @@ object HrvFeatureCalculator {
 
         val sorted = physiological.map { it.ibiMs }.sorted()
         val median = sorted[sorted.size / 2].toDouble()
-        val valid = physiological.filter { abs(it.ibiMs - median) < 0.20 * median }
+        val valid = physiological.filter {
+            abs(it.ibiMs - median) < OUTLIER_MEDIAN_DEVIATION_RATIO * median
+        }
         if (valid.size < 2) return null
 
         val mean = valid.map { it.ibiMs.toDouble() }.average()
@@ -89,7 +98,7 @@ object HrvFeatureCalculator {
         else sqrt(successiveDiffs.map { it * it }.average())
 
         val pnn50 = if (successiveDiffs.isEmpty()) 0.0
-        else 100.0 * successiveDiffs.count { abs(it) > 50 } / successiveDiffs.size
+        else 100.0 * successiveDiffs.count { abs(it) > PNN50_THRESHOLD_MS } / successiveDiffs.size
 
         val meanHr = if (mean > 0) 60_000.0 / mean else 0.0
         val windowSec = valid.sumOf { it.ibiMs } / 1000.0

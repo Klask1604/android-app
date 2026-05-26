@@ -45,7 +45,10 @@ object WatchStateRepository {
     // ----- publish intervals (mutated by display-state changes) -----
     @Volatile var mqttPublishIntervalMs: Long = 1_000L
     @Volatile var hrvPublishIntervalMs: Long = 30_000L
-    @Volatile var hrFlushIntervalMs: Long = 4_000L
+    // Flush the Samsung HR tracker every second so IBI beats are delivered at
+    // ~1 Hz instead of arriving in ~4-5 s bursts. acquisition/batch is already
+    // published every second; this stops most batches from carrying empty IBI.
+    @Volatile var hrFlushIntervalMs: Long = 1_000L
     @Volatile var liveWatchEnabled: Boolean = true
     @Volatile var liveStreamEnabled: Boolean = true
 

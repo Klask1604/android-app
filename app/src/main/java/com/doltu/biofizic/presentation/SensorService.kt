@@ -262,7 +262,7 @@ class SensorService : Service(), SensorEventListener {
         displayOn = on
         hrvPublishIntervalMs = 30_000L
         mqttPublishIntervalMs = 1_000L
-        hrFlushIntervalMs = 4_000L
+        hrFlushIntervalMs = 1_000L  // deliver IBI every ~1 s, not in 4-5 s bursts
         Log.i(
             TAG,
             "Ecran ${if (on) "ON" else "OFF"} (signal=${hrvPublishIntervalMs}ms hrFlush=${hrFlushIntervalMs}ms)"
@@ -860,12 +860,12 @@ class SensorService : Service(), SensorEventListener {
 
 
     private fun enqueuePpg(dataPoints: List<DataPoint>) {
-        // Samples are kept in the assembler and bundled into acquisition/batch v2
-        // once per second by publishSensorBatches. No standalone publish on
-        // biofizic/ppg/raw any more (the server has no consumer for it).
-        val recvMs = System.currentTimeMillis()
+        // Raw PPG feeds production only indirectly (cardiac-band energy is from
+        // the accelerometer). It is buffered into the acquisition batch only for
+        // the server's research/legacy peak-detection demos, behind the
+        // PUBLISH_RAW_PPG toggle. Off by default to save bandwidth/power.
+        if (!AcquisitionAssembler.PUBLISH_RAW_PPG) return
         for (dp in dataPoints) {
-            logTimestampProbe("PPG", dp.timestamp, recvMs)
             val g = dp.getValue(ValueKey.PpgSet.PPG_GREEN)
             val ir = dp.getValue(ValueKey.PpgSet.PPG_IR)
             assembler.addPpgSample(dp.timestamp, g, ir)
@@ -1014,9 +1014,9 @@ class SensorService : Service(), SensorEventListener {
         if (obj.has("profile_ready")) {
             profileReady = obj.optBoolean("profile_ready", profileReady)
         }
-        val motionClass = obj.optString("motion_class", "")
-        if (motionClass.isNotEmpty()) {
-            motionGated = motionClass != "STILL"
+        val motionState = obj.optString("motion_state", "")
+        if (motionState.isNotEmpty()) {
+            motionGated = motionState != "still"
         }
         syncUiState()
     }
@@ -1067,23 +1067,27 @@ class SensorService : Service(), SensorEventListener {
                 hrv.windowSec >= MIN_WINDOW_SEC_FOR_SIGNAL
         }
 
-        val ppgSnapshot = assembler.snapshotPpgWindow(tsPublish)
+        val accBandCardiac = assembler.computeCardiacBandEnergy(tsPublish)
         val ibiSlice = assembler.drainIbiForPublish(tsPublish)
+        val ppgSnapshot =
+            if (AcquisitionAssembler.PUBLISH_RAW_PPG) assembler.snapshotPpgWindow(tsPublish)
+            else emptyList()
         val payload = assembler.buildAcquisitionPayload(
             tsPublish = tsPublish,
             motion = motion,
-            ppgSnapshot = ppgSnapshot,
+            accBandCardiac = accBandCardiac,
             ibiSlice = ibiSlice,
             heartRateBpm = lastHr,
             displayOn = displayOn,
             skinTempC = lastSkinTempC,
             ambientTempC = lastAmbientTempC,
+            ppgSnapshot = ppgSnapshot,
         )
         publish("biofizic/acquisition/batch", payload.json)
-        if (payload.ibiCount > 0 || payload.ppgCount > 0) {
+        if (payload.ibiCount > 0) {
             Log.i(
                 TAG,
-                "acquisition seq=${payload.sequence} ibi=${payload.ibiCount} source=${payload.ibiSource} ppg=${payload.ppgCount}",
+                "acquisition seq=${payload.sequence} ibi=${payload.ibiCount} source=${payload.ibiSource}",
             )
         }
         syncUiState()
