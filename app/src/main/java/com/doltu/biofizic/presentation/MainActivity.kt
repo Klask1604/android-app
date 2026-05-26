@@ -13,12 +13,22 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -31,9 +41,14 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.Path
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -173,9 +188,6 @@ private val BtnStop = Color(0xFFD50000)
 
 /** Zonă sigură pe ecran rotund (~65% din diametru). */
 private const val SAFE_WIDTH_FRACTION = 0.62f
-private const val RING_FRACTION = 0.30f
-private val RING_MIN = 60.dp
-private val RING_MAX = 74.dp
 
 @Composable
 fun BiofizicWatchApp() {
@@ -188,6 +200,9 @@ fun BiofizicWatchApp() {
         }
     }
 
+    var showQuestionnaire by remember { mutableStateOf(false) }
+    var questionnaireForStart by remember { mutableStateOf(true) }
+
     MaterialTheme {
         BoxWithConstraints(
             modifier = Modifier
@@ -196,73 +211,218 @@ fun BiofizicWatchApp() {
         ) {
             val minSide = minOf(maxWidth, maxHeight)
             val contentW = minSide * SAFE_WIDTH_FRACTION
-            val ringSize = (minSide * RING_FRACTION).coerceIn(RING_MIN, RING_MAX)
 
-            WatchFaceContent(
-                isRunning = uiState.isRunning,
-                mqttOk = uiState.isMqttConnected,
-                hr = uiState.lastHr,
-                arousalFused = uiState.arousalFused,
-                arousal10 = uiState.arousal10,
-                arousalLabel = uiState.arousalLabel,
-                confidence = uiState.arousalConfidence,
-                motionGated = uiState.motionGated,
-                profileReady = uiState.profileReady,
-                signalOk = uiState.signalOk,
-                windowSec = uiState.lastWindowSec.toFloat(),
-                calibrating = uiState.calibrationPhase == "collecting",
-                calMessage = uiState.calibrationMessage,
-                contentWidth = contentW,
-                ringSize = ringSize,
-                onLongPressRecalibrate = {
-                    if (uiState.isRunning) {
+            if (showQuestionnaire) {
+                MoodQuestionnaire(
+                    contentWidth = contentW,
+                    onPick = { arousal ->
+                        val action = if (questionnaireForStart) SensorService.ACTION_START
+                        else SensorService.ACTION_RECALIBRATE
                         context.startForegroundService(
                             Intent(context, SensorService::class.java).apply {
-                                action = SensorService.ACTION_RECALIBRATE
+                                this.action = action
+                                putExtra(SensorService.EXTRA_REPORTED_AROUSAL, arousal)
                             },
                         )
-                    }
-                },
-                modifier = Modifier
-                    .width(contentW)
-                    .align(Alignment.Center)
-                    .offset(y = 8.dp),
-            )
-
-            val btnColor by animateColorAsState(
-                if (uiState.isRunning) BtnStop else BtnStart,
-                animationSpec = tween(200),
-                label = "btn",
-            )
-            Button(
-                onClick = {
-                    val action = if (uiState.isRunning) SensorService.ACTION_STOP
-                    else SensorService.ACTION_START
-                    context.startForegroundService(
-                        Intent(context, SensorService::class.java).apply { this.action = action },
-                    )
-                    if (action == SensorService.ACTION_STOP) {
-                        (context as? MainActivity)?.window?.clearFlags(
-                            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
-                        )
-                    } else {
                         (context as? MainActivity)?.applyKeepScreenOn()
-                    }
-                },
-                colors = ButtonDefaults.buttonColors(backgroundColor = btnColor),
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = 16.dp)
-                    .size(width = (contentW * 0.72f).coerceAtLeast(52.dp), height = 28.dp),
-            ) {
-                Text(
-                    text = if (uiState.isRunning) "Stop" else "Start",
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = Color.White,
+                        showQuestionnaire = false
+                    },
+                    onCancel = { showQuestionnaire = false },
+                    modifier = Modifier.align(Alignment.Center).width(contentW),
                 )
+            } else {
+                // One centered column: info on top, buttons below — no overlap.
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 8.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.Center,
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    WatchFaceContent(
+                        isRunning = uiState.isRunning,
+                        mqttOk = uiState.isMqttConnected,
+                        hr = uiState.lastHr,
+                        arousalFused = uiState.arousalFused,
+                        arousal10 = uiState.arousal10,
+                        arousalLabel = uiState.arousalLabel,
+                        confidence = uiState.arousalConfidence,
+                        dominantChannel = uiState.dominantChannel,
+                        motionGated = uiState.motionGated,
+                        profileReady = uiState.profileReady,
+                        signalOk = uiState.signalOk,
+                        windowSec = uiState.lastWindowSec.toFloat(),
+                        calibrating = uiState.calibrationPhase == "collecting",
+                        calMessage = uiState.calibrationMessage,
+                        contentWidth = contentW,
+                        onLongPressRecalibrate = {
+                            if (uiState.isRunning) {
+                                questionnaireForStart = false
+                                showQuestionnaire = true
+                            }
+                        },
+                        modifier = Modifier.width(contentW),
+                    )
+
+                    Spacer(Modifier.height(10.dp))
+
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        if (uiState.isRunning) {
+                            SquareButton(
+                                color = AccentMotion,
+                                side = 34.dp,
+                                onClick = {
+                                    questionnaireForStart = false
+                                    showQuestionnaire = true
+                                },
+                            ) { RecalibrateGlyph() }
+                        }
+                        val btnColor by animateColorAsState(
+                            if (uiState.isRunning) BtnStop else BtnStart,
+                            animationSpec = tween(200),
+                            label = "btn",
+                        )
+                        SquareButton(
+                            color = btnColor,
+                            side = 40.dp,
+                            onClick = {
+                                if (uiState.isRunning) {
+                                    context.startForegroundService(
+                                        Intent(context, SensorService::class.java).apply {
+                                            action = SensorService.ACTION_STOP
+                                        },
+                                    )
+                                    (context as? MainActivity)?.window?.clearFlags(
+                                        WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                                    )
+                                } else {
+                                    questionnaireForStart = true
+                                    showQuestionnaire = true
+                                }
+                            },
+                        ) {
+                            if (uiState.isRunning) StopGlyph() else PlayGlyph()
+                        }
+                    }
+                }
             }
         }
+    }
+}
+
+/** Square (rounded) button hosting a Canvas-drawn glyph (no icon dependency). */
+@Composable
+private fun SquareButton(
+    color: Color,
+    side: Dp,
+    onClick: () -> Unit,
+    glyph: @Composable () -> Unit,
+) {
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier
+            .size(side)
+            .clip(RoundedCornerShape(11.dp))
+            .background(color)
+            .clickable(onClick = onClick),
+    ) {
+        glyph()
+    }
+}
+
+@Composable
+private fun PlayGlyph() {
+    Canvas(modifier = Modifier.size(16.dp)) {
+        val p = Path().apply {
+            moveTo(size.width * 0.28f, size.height * 0.18f)
+            lineTo(size.width * 0.82f, size.height * 0.5f)
+            lineTo(size.width * 0.28f, size.height * 0.82f)
+            close()
+        }
+        drawPath(p, Color.White)
+    }
+}
+
+@Composable
+private fun StopGlyph() {
+    Canvas(modifier = Modifier.size(14.dp)) {
+        drawRoundRect(
+            color = Color.White,
+            topLeft = Offset(size.width * 0.18f, size.height * 0.18f),
+            size = Size(size.width * 0.64f, size.height * 0.64f),
+        )
+    }
+}
+
+@Composable
+private fun RecalibrateGlyph() {
+    Canvas(modifier = Modifier.size(14.dp)) {
+        val stroke = 2.dp.toPx()
+        drawArc(
+            color = Color.White,
+            startAngle = 40f,
+            sweepAngle = 280f,
+            useCenter = false,
+            style = Stroke(width = stroke, cap = StrokeCap.Round),
+        )
+        // small arrowhead at the open end
+        val a = Path().apply {
+            moveTo(size.width * 0.86f, size.height * 0.30f)
+            lineTo(size.width * 0.98f, size.height * 0.52f)
+            lineTo(size.width * 0.72f, size.height * 0.50f)
+            close()
+        }
+        drawPath(a, Color.White)
+    }
+}
+
+@Composable
+private fun MoodQuestionnaire(
+    contentWidth: Dp,
+    onPick: (Double) -> Unit,
+    onCancel: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    // Single activation axis (parasympathetic -> sympathetic). The pick anchors
+    // where the personal baseline sits on the 0..1 arousal scale.
+    val options = listOf(
+        "Calm" to 0.2,
+        "Normal" to 0.4,
+        "Alert" to 0.6,
+        "Stresat" to 0.8,
+    )
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            text = "Cum te simți?",
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = TextPrimary,
+        )
+        Spacer(Modifier.height(6.dp))
+        options.forEach { (label, arousal) ->
+            Button(
+                onClick = { onPick(arousal) },
+                colors = ButtonDefaults.buttonColors(backgroundColor = RingTrack),
+                modifier = Modifier
+                    .width(contentWidth)
+                    .height(26.dp)
+                    .padding(vertical = 2.dp),
+            ) {
+                Text(label, fontSize = 11.sp, color = TextPrimary)
+            }
+        }
+        Spacer(Modifier.height(2.dp))
+        Text(
+            text = "apoi stai liniștit 1–2 min",
+            fontSize = 8.sp,
+            color = TextMuted,
+        )
     }
 }
 
@@ -276,6 +436,7 @@ private fun WatchFaceContent(
     arousal10: Int,
     arousalLabel: String,
     confidence: Float,
+    dominantChannel: String,
     motionGated: Boolean,
     profileReady: Boolean,
     signalOk: Boolean,
@@ -283,15 +444,25 @@ private fun WatchFaceContent(
     calibrating: Boolean,
     calMessage: String,
     contentWidth: Dp,
-    ringSize: Dp,
     onLongPressRecalibrate: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val hasVerdict = isRunning && arousalFused >= 0f
     val accent = arousalAccent(hasVerdict, arousal10, motionGated, isRunning, mqttOk)
 
+    val statusText = when {
+        calibrating && calMessage.isNotBlank() -> calMessage
+        hasVerdict -> arousalLabel
+        isRunning && !mqttOk -> "Fără server"
+        isRunning -> "Se încarcă"
+        else -> "Apasă ▶"
+    }
+    val bigValue = if (hasVerdict) "%.0f".format(arousalFused) else "—"
+
     Column(
-        modifier = modifier.width(contentWidth),
+        modifier = modifier
+            .width(contentWidth)
+            .combinedClickable(onClick = {}, onLongClick = onLongPressRecalibrate),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         CompactStatusLine(
@@ -302,83 +473,170 @@ private fun WatchFaceContent(
             calibrating = calibrating,
         )
 
-        Spacer(modifier = Modifier.height(4.dp))
+        Spacer(modifier = Modifier.height(6.dp))
 
+        // Compact arousal card: label + value + bar (no oversized circle).
         Box(
-            contentAlignment = Alignment.Center,
             modifier = Modifier
-                .size(ringSize)
-                .combinedClickable(
-                    onClick = {},
-                    onLongClick = onLongPressRecalibrate,
-                ),
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(accent.copy(alpha = 0.16f))
+                .border(1.dp, accent.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+                .padding(horizontal = 10.dp, vertical = 5.dp),
+            contentAlignment = Alignment.Center,
         ) {
-            // Target ring fill. Smoothing of the integer arousal_10 itself
-            // happens server-side via LIVE_AROUSAL_HYSTERESIS_TICKS; here we
-            // only animate the fill so that the rare legitimate flip does not
-            // look like a sudden jump.
-            val targetProgress = when {
-                !isRunning -> 0f
-                hasVerdict -> arousalFused / 10f
-                else -> 0f
-            }
-            val animatedProgress by animateFloatAsState(
-                targetValue = targetProgress,
-                animationSpec = tween(durationMillis = 500),
-                label = "arousal_ring",
-            )
-            ArousalGauge(
-                progress = animatedProgress,
-                accent = accent,
-                modifier = Modifier.fillMaxSize(),
-            )
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(
-                    text = when {
-                        hasVerdict -> "%.1f".format(arousalFused)
-                        isRunning && mqttOk -> "…"
-                        isRunning -> "—"
-                        else -> "○"
-                    },
-                    fontSize = 22.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = if (hasVerdict || isRunning) TextPrimary else TextMuted,
-                    lineHeight = 22.sp,
-                )
-                Text(text = "/10", fontSize = 7.sp, color = TextMuted)
+            if (calibrating) {
+                // While the profile calibrates there is no score yet: show a
+                // rotating loader + "Calibrare" instead of the empty "—".
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CalibrationSpinner(accent = accent)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Calibrare",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = accent,
+                    )
+                    if (calMessage.isNotBlank()) {
+                        Text(
+                            text = calMessage,
+                            fontSize = 8.sp,
+                            color = TextMuted,
+                            textAlign = TextAlign.Center,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(top = 1.dp),
+                        )
+                    }
+                }
+            } else {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Row(verticalAlignment = Alignment.Bottom) {
+                        Text(
+                            text = bigValue,
+                            fontSize = 22.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = TextPrimary,
+                            lineHeight = 22.sp,
+                        )
+                        Text(
+                            text = "/10  ",
+                            fontSize = 8.sp,
+                            color = TextMuted,
+                            modifier = Modifier.padding(bottom = 3.dp),
+                        )
+                        Text(
+                            text = statusText,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = accent,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(bottom = 2.dp),
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    ArousalBar(
+                        fraction = if (hasVerdict) arousalFused / 10f else 0f,
+                        accent = accent,
+                    )
+                }
             }
         }
 
+        Spacer(modifier = Modifier.height(6.dp))
+
+        // Metrics stacked, one per line — readable, no edge wrap.
+        MetricRow("Ritm", if (hr > 0) "$hr bpm" else "—")
         Spacer(modifier = Modifier.height(3.dp))
-
-        Text(
-            text = when {
-                calibrating && calMessage.isNotBlank() -> calMessage
-                hasVerdict -> arousalLabel
-                isRunning && !mqttOk -> "Fără server"
-                isRunning -> "Se încarcă"
-                else -> "Gata"
-            },
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Medium,
-            color = TextPrimary,
-            textAlign = TextAlign.Center,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
+        val channelTag = when (dominantChannel) {
+            "hr" -> " · HR"      // motion: verdict carried by heart rate
+            "blend" -> " · mix"
+            "none" -> " · —"
+            else -> ""           // "hrv": still/precise, no tag needed
+        }
+        MetricRow(
+            "Încredere",
+            if (hasVerdict) "${(confidence * 100).toInt()}%$channelTag" else "—",
         )
+        Spacer(modifier = Modifier.height(3.dp))
+        MetricRow("Stare", if (motionGated) "mișcare" else "calm")
+    }
+}
 
-        Text(
-            text = metaLine(
-                isRunning, hasVerdict, hr, confidence, motionGated,
-                profileReady, signalOk, windowSec, calibrating,
-            ),
-            fontSize = 7.sp,
-            color = TextMuted,
-            textAlign = TextAlign.Center,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.padding(top = 1.dp),
+/** Indeterminate loader shown in the central card while the profile calibrates:
+ *  a faint full-circle track with a rotating accent arc. */
+@Composable
+private fun CalibrationSpinner(accent: Color, size: Dp = 30.dp) {
+    val transition = rememberInfiniteTransition(label = "calib")
+    val angle by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 900, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "calib-angle",
+    )
+    Canvas(modifier = Modifier.size(size)) {
+        val stroke = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round)
+        val inset = stroke.width / 2f
+        val arcSize = Size(this.size.width - stroke.width, this.size.height - stroke.width)
+        drawArc(
+            color = RingTrack,
+            startAngle = 0f,
+            sweepAngle = 360f,
+            useCenter = false,
+            topLeft = Offset(inset, inset),
+            size = arcSize,
+            style = stroke,
         )
+        drawArc(
+            color = accent,
+            startAngle = angle,
+            sweepAngle = 270f,
+            useCenter = false,
+            topLeft = Offset(inset, inset),
+            size = arcSize,
+            style = stroke,
+        )
+    }
+}
+
+@Composable
+private fun ArousalBar(fraction: Float, accent: Color) {
+    val animated by animateFloatAsState(
+        targetValue = fraction.coerceIn(0f, 1f),
+        animationSpec = tween(500),
+        label = "bar",
+    )
+    Canvas(modifier = Modifier.fillMaxWidth().height(5.dp)) {
+        val r = size.height / 2f
+        drawRoundRect(color = RingTrack, cornerRadius = CornerRadius(r, r))
+        if (animated > 0.01f) {
+            drawRoundRect(
+                color = accent,
+                size = Size(size.width * animated, size.height),
+                cornerRadius = CornerRadius(r, r),
+            )
+        }
+    }
+}
+
+/** Full-width metric row: label on the left, value on the right. */
+@Composable
+private fun MetricRow(label: String, value: String) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(9.dp))
+            .background(Color(0xFF1A1F2B))
+            .padding(horizontal = 10.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(label, fontSize = 9.sp, color = TextMuted)
+        Text(value, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary)
     }
 }
 
@@ -456,51 +714,6 @@ private fun StatusDot(label: String, color: Color) {
     }
 }
 
-@Composable
-private fun ArousalGauge(
-    progress: Float,
-    accent: Color,
-    modifier: Modifier = Modifier,
-) {
-    val animatedProgress by animateFloatAsState(
-        targetValue = progress.coerceIn(0f, 1f),
-        animationSpec = tween(400),
-        label = "gauge",
-    )
-    val accentAnim by animateColorAsState(accent, animationSpec = tween(300), label = "accent")
-
-    Canvas(modifier = modifier) {
-        val stroke = 5.dp.toPx()
-        val pad = stroke * 1.2f
-        val arcSize = Size(size.width - pad * 2, size.height - pad * 2)
-        val topLeft = Offset(pad, pad)
-        // Arc cu gol jos (buton) — nu urcă spre marginea de sus
-        val start = 155f
-        val sweepTotal = 230f
-
-        drawArc(
-            color = RingTrack,
-            startAngle = start,
-            sweepAngle = sweepTotal,
-            useCenter = false,
-            topLeft = topLeft,
-            size = arcSize,
-            style = Stroke(width = stroke, cap = StrokeCap.Round),
-        )
-        if (animatedProgress > 0.01f) {
-            drawArc(
-                color = accentAnim,
-                startAngle = start,
-                sweepAngle = sweepTotal * animatedProgress,
-                useCenter = false,
-                topLeft = topLeft,
-                size = arcSize,
-                style = Stroke(width = stroke, cap = StrokeCap.Round),
-            )
-        }
-    }
-}
-
 private fun arousalAccent(
     hasArousal: Boolean,
     arousal10: Int,
@@ -517,26 +730,3 @@ private fun arousalAccent(
     else -> AccentHigh
 }
 
-private fun metaLine(
-    isRunning: Boolean,
-    hasVerdict: Boolean,
-    hr: Int,
-    confidence: Float,
-    motionGated: Boolean,
-    profileReady: Boolean,
-    signalOk: Boolean,
-    windowSec: Float,
-    calibrating: Boolean = false,
-): String = when {
-    calibrating -> "5 min repaus liniștit"
-    !isRunning -> "Start · ține apăsat gauge = recalibrare"
-    !hasVerdict -> "Aștept verdict server"
-    !signalOk && windowSec > 0f -> "Fereastră ${windowSec.toInt()}s · min 10s"
-    !signalOk -> "Aștept HRV"
-    motionGated -> "Mișcare · ${hr}bpm"
-    hasVerdict && hr > 0 -> "Conf ${(confidence * 100).toInt()}% · ${hr}bpm"
-    hr > 0 -> "${hr}bpm"
-    else -> "Aștept"
-}
-
-private fun Dp.coerceAtLeast(min: Dp): Dp = if (this < min) min else this

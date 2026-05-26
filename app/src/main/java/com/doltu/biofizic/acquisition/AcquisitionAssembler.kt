@@ -56,9 +56,9 @@ class AcquisitionAssembler(
 
         // Research toggle: include the raw PPG arrays (green/ir/ts) in the
         // acquisition payload for the server's legacy peak-detection demos.
-        // Off by default — raw PPG has no production consumer and costs
-        // bandwidth. Flip and rebuild together with ENABLE_RAW_PPG on the server.
-        const val PUBLISH_RAW_PPG = false
+        // ON for the research phase (server has ENABLE_RAW_PPG on). Set back to
+        // false for the final product to save bandwidth/power.
+        const val PUBLISH_RAW_PPG = true
     }
 
     /** Snapshot of motion stats computed over the last 1 s wall-clock window. */
@@ -130,15 +130,22 @@ class AcquisitionAssembler(
 
     /** Buffer one raw PPG sample (research only; gated by PUBLISH_RAW_PPG). */
     fun addPpgSample(ts: Long, green: Int, ir: Int) {
-        synchronized(ppgBatchLock) { ppgBatch.add(Triple(ts, green, ir)) }
+        synchronized(ppgBatchLock) {
+            ppgBatch.add(Triple(ts, green, ir))
+            // Cap so a missed publish can't grow it unbounded (~2 s @ 25 Hz x safety).
+            while (ppgBatch.size > 1500) ppgBatch.removeAt(0)
+        }
     }
 
-    /** Drain the last 1 s of buffered PPG samples for the current batch. */
-    fun snapshotPpgWindow(tsPublish: Long): List<Triple<Long, Int, Int>> {
+    /**
+     * Drain ALL PPG buffered since the previous publish (not just the last 1 s).
+     * The Samsung PPG tracker delivers in bursts, so a fixed 1 s slice dropped
+     * most samples — mirror the IBI drain so every sample reaches the server.
+     */
+    fun drainPpgForPublish(): List<Triple<Long, Int, Int>> {
         synchronized(ppgBatchLock) {
-            val cutoff = tsPublish - 1_000L
-            val snap = ppgBatch.filter { it.first >= cutoff }
-            ppgBatch.removeAll { it.first >= cutoff }
+            val snap = ppgBatch.toList()
+            ppgBatch.clear()
             return snap
         }
     }

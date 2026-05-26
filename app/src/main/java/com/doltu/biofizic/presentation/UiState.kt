@@ -9,6 +9,9 @@ data class UiState(
     val arousal10: Int = -1,
     val arousalLabel: String = "—",
     val arousalConfidence: Float = 0f,
+    // Which signal drives the verdict: "hrv" (still, precise), "hr" (motion,
+    // robust), "blend", "none". Lets the UI show confidence is HR-based in motion.
+    val dominantChannel: String = "hrv",
     val motionGated: Boolean = false,
     val profileReady: Boolean = false,
     val signalOk: Boolean = false,

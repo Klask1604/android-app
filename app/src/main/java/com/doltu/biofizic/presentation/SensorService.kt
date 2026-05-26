@@ -89,6 +89,12 @@ class SensorService : Service(), SensorEventListener {
         const val ACTION_START = "com.doltu.biofizic.ACTION_START"
         const val ACTION_STOP = "com.doltu.biofizic.ACTION_STOP"
         const val ACTION_RECALIBRATE = "com.doltu.biofizic.ACTION_RECALIBRATE"
+        // Self-reported arousal in [0,1] from the watch questionnaire; anchors
+        // where the new baseline sits on the arousal scale.
+        const val EXTRA_REPORTED_AROUSAL = "com.doltu.biofizic.EXTRA_REPORTED_AROUSAL"
+
+        // Pending self-report to send as a calibration once MQTT is connected.
+        @Volatile var pendingReportedArousal: Double = Double.NaN
 
         private val state = WatchStateRepository
 
@@ -179,6 +185,9 @@ class SensorService : Service(), SensorEventListener {
         var arousalConfidence: Float
             get() = state.arousalConfidence
             set(value) { state.arousalConfidence = value }
+        var dominantChannel: String
+            get() = state.dominantChannel
+            set(value) { state.dominantChannel = value }
         var arousalLabel: String
             get() = state.arousalLabel
             set(value) { state.arousalLabel = value }
@@ -311,6 +320,8 @@ class SensorService : Service(), SensorEventListener {
     private var lastStatusLogMs = 0L
 
     private fun logPeriodicStatus() {
+        flushPendingCalibration()  // runs every tick (cheap) so a self-report is
+        // sent as soon as MQTT comes up after Start
         val now = System.currentTimeMillis()
         if (now - lastStatusLogMs < 15_000L) return
         lastStatusLogMs = now
@@ -527,6 +538,10 @@ class SensorService : Service(), SensorEventListener {
                     stopSelf()
                     return START_NOT_STICKY
                 }
+                if (intent.hasExtra(EXTRA_REPORTED_AROUSAL)) {
+                    // Sent once MQTT is up (see logPeriodicStatus).
+                    pendingReportedArousal = intent.getDoubleExtra(EXTRA_REPORTED_AROUSAL, Double.NaN)
+                }
                 if (!isRunning) {
                     Log.i(TAG, "Pornire tracking (ACTION_START)")
                     isRunning = true
@@ -535,10 +550,13 @@ class SensorService : Service(), SensorEventListener {
                 }
             }
             ACTION_RECALIBRATE -> {
+                val reported = intent.getDoubleExtra(EXTRA_REPORTED_AROUSAL, Double.NaN)
                 if (isRunning && isMqttConnected) {
-                    requestProfileRecalibration()
+                    requestProfileRecalibration(reported)
                 } else {
-                    Log.w(TAG, "Recalibrare: tracking sau MQTT inactiv")
+                    // Defer until MQTT connects.
+                    pendingReportedArousal = reported
+                    Log.w(TAG, "Recalibrare amânată: MQTT inactiv")
                 }
                 return START_STICKY
             }
@@ -976,15 +994,26 @@ class SensorService : Service(), SensorEventListener {
         )
     }
 
-    private fun requestProfileRecalibration() {
+    private fun requestProfileRecalibration(reportedArousal: Double = Double.NaN) {
         val ts = System.currentTimeMillis()
+        val reportedJson =
+            if (reportedArousal.isNaN()) "" else ""","reported_arousal":$reportedArousal"""
         publish(
             "biofizic/cmd/calibrate",
-            """{"ts":$ts,"action":"profile","source":"watch"}""",
+            """{"ts":$ts,"action":"profile","source":"watch"$reportedJson}""",
         )
         calibrationPhase = "collecting"
-        calibrationMessage = "Recalibrare… profil vechi activ ~5 min"
-        Log.i(TAG, "Recalibrare profil trimisă pe MQTT")
+        calibrationMessage = "Recalibrare… stai liniștit 1–2 min"
+        syncUiState()  // push "collecting" to Compose so the spinner shows now
+        Log.i(TAG, "Recalibrare profil trimisă (reported=$reportedArousal)")
+    }
+
+    /** Send a deferred self-report calibration once MQTT is live. */
+    private fun flushPendingCalibration() {
+        if (!pendingReportedArousal.isNaN() && isRunning && isMqttConnected) {
+            requestProfileRecalibration(pendingReportedArousal)
+            pendingReportedArousal = Double.NaN
+        }
     }
 
     private fun parseCalibrationStatus(json: String) {
@@ -1010,6 +1039,7 @@ class SensorService : Service(), SensorEventListener {
         arousal10 = a10.coerceIn(0, 10)
         arousalFused = a10.toFloat().coerceIn(0f, 10f)
         arousalConfidence = obj.optDouble("confidence", 0.0).toFloat()
+        dominantChannel = obj.optString("dominant_channel", dominantChannel).ifEmpty { dominantChannel }
         arousalLabel = obj.optString("emotion", "—").ifEmpty { "—" }
         if (obj.has("profile_ready")) {
             profileReady = obj.optBoolean("profile_ready", profileReady)
@@ -1070,7 +1100,7 @@ class SensorService : Service(), SensorEventListener {
         val accBandCardiac = assembler.computeCardiacBandEnergy(tsPublish)
         val ibiSlice = assembler.drainIbiForPublish(tsPublish)
         val ppgSnapshot =
-            if (AcquisitionAssembler.PUBLISH_RAW_PPG) assembler.snapshotPpgWindow(tsPublish)
+            if (AcquisitionAssembler.PUBLISH_RAW_PPG) assembler.drainPpgForPublish()
             else emptyList()
         val payload = assembler.buildAcquisitionPayload(
             tsPublish = tsPublish,

@@ -60,6 +60,7 @@ object WatchStateRepository {
     @Volatile var arousalFused: Float = -1f
     @Volatile var arousal10: Int = -1
     @Volatile var arousalConfidence: Float = 0f
+    @Volatile var dominantChannel: String = "hrv"
     @Volatile var arousalLabel: String = "-"
     @Volatile var motionGated: Boolean = false
     @Volatile var profileReady: Boolean = false
@@ -80,6 +81,7 @@ object WatchStateRepository {
             arousal10 = arousal10,
             arousalLabel = arousalLabel,
             arousalConfidence = arousalConfidence,
+            dominantChannel = dominantChannel,
             motionGated = motionGated,
             profileReady = profileReady,
             signalOk = signalOk,
