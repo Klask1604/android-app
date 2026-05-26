@@ -33,8 +33,6 @@ import com.samsung.android.service.health.tracking.data.HealthTrackerType
 import com.samsung.android.service.health.tracking.data.PpgType
 import com.samsung.android.service.health.tracking.data.ValueKey
 import androidx.core.content.ContextCompat
-import org.eclipse.paho.client.mqttv3.*
-import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.sqrt
@@ -54,9 +52,19 @@ class SensorService : Service(), SensorEventListener {
     private lateinit var sensorManager: SensorManager
 
     // ── MQTT ──
-    private lateinit var mqttClient: MqttClient
     private val BROKER_URL: String by lazy { getString(R.string.mqtt_broker_url) }
     private val CLIENT_ID = "GalaxyWatch7"
+    private val mqttSession: MqttSession by lazy {
+        MqttSession(
+            brokerUrl = BROKER_URL,
+            clientId = CLIENT_ID,
+            tag = TAG,
+            onEpochState = { parseEpochStateMessage(it) },
+            onStateLive = { parseStateLiveMessage(it) },
+            onCalibrationStatus = { parseCalibrationStatus(it) },
+            onMessagePublished = { msgCount++ },
+        )
+    }
 
     // ── Samsung Health SDK ──
     private var healthTrackingService: HealthTrackingService? = null
@@ -73,70 +81,123 @@ class SensorService : Service(), SensorEventListener {
     private var watchdogThread: Thread? = null
 
     // ══════════════════════════════════════════
-    //  Companion: state exposed to UI
+    //  Companion: thin facade over WatchStateRepository so existing call sites
+    //  (`SensorService.isRunning`, `MainActivity` Compose collector, etc.)
+    //  keep working without changes. All real state lives in the repository.
     // ══════════════════════════════════════════
     companion object {
         const val ACTION_START = "com.doltu.biofizic.ACTION_START"
         const val ACTION_STOP = "com.doltu.biofizic.ACTION_STOP"
         const val ACTION_RECALIBRATE = "com.doltu.biofizic.ACTION_RECALIBRATE"
 
-        @Volatile var isRunning = false
-        @Volatile var isMqttConnected = false
-        @Volatile var lastHr = 0
-        @Volatile var activeSensors = 0
-        @Volatile var ppgActive = false
-        @Volatile var accActive = false
-        @Volatile var gyroActive = false
-        @Volatile var skinTempActive = false
-        @Volatile var ibiActive = false
+        private val state = WatchStateRepository
 
-        // Contoare pentru debug / UI
-        @Volatile var msgCount = 0L
+        // Lifecycle / connectivity
+        var isRunning: Boolean
+            get() = state.isRunning
+            set(value) { state.isRunning = value }
+        var isMqttConnected: Boolean
+            get() = state.isMqttConnected
+            set(value) { state.isMqttConnected = value }
+        var activeSensors: Int
+            get() = state.activeSensors
+            set(value) { state.activeSensors = value }
+        var msgCount: Long
+            get() = state.msgCount
+            set(value) { state.msgCount = value }
 
-        @Volatile var mqttPublishIntervalMs = 1_000L
-        @Volatile var hrvPublishIntervalMs = 30_000L
-        @Volatile var hrFlushIntervalMs = 4_000L
-        @Volatile var liveWatchEnabled = true
+        // Per-tracker availability
+        var ppgActive: Boolean
+            get() = state.ppgActive
+            set(value) { state.ppgActive = value }
+        var accActive: Boolean
+            get() = state.accActive
+            set(value) { state.accActive = value }
+        var gyroActive: Boolean
+            get() = state.gyroActive
+            set(value) { state.gyroActive = value }
+        var skinTempActive: Boolean
+            get() = state.skinTempActive
+            set(value) { state.skinTempActive = value }
+        var ibiActive: Boolean
+            get() = state.ibiActive
+            set(value) { state.ibiActive = value }
+
+        // Last sensor readings
+        var lastHr: Int
+            get() = state.lastHr
+            set(value) { state.lastHr = value }
+        var lastRmssd: Double
+            get() = state.lastRmssd
+            set(value) { state.lastRmssd = value }
+        var lastSkinTempC: Double
+            get() = state.lastSkinTempC
+            set(value) { state.lastSkinTempC = value }
+        var lastAmbientTempC: Double
+            get() = state.lastAmbientTempC
+            set(value) { state.lastAmbientTempC = value }
+        var lastWindowSec: Double
+            get() = state.lastWindowSec
+            set(value) { state.lastWindowSec = value }
+        var signalOk: Boolean
+            get() = state.signalOk
+            set(value) { state.signalOk = value }
+
+        // Publish intervals
+        var mqttPublishIntervalMs: Long
+            get() = state.mqttPublishIntervalMs
+            set(value) { state.mqttPublishIntervalMs = value }
+        var hrvPublishIntervalMs: Long
+            get() = state.hrvPublishIntervalMs
+            set(value) { state.hrvPublishIntervalMs = value }
+        var hrFlushIntervalMs: Long
+            get() = state.hrFlushIntervalMs
+            set(value) { state.hrFlushIntervalMs = value }
+        var liveWatchEnabled: Boolean
+            get() = state.liveWatchEnabled
+            set(value) { state.liveWatchEnabled = value }
+        var liveStreamEnabled: Boolean
+            get() = state.liveStreamEnabled
+            set(value) { state.liveStreamEnabled = value }
         private const val LIVE_WATCH_INTERVAL_MS = 1_000L
-        @Volatile var liveStreamEnabled = true
-        @Volatile var lastSkinTempC = 0.0
-        @Volatile var lastAmbientTempC = 0.0
-        @Volatile var displayOn = true
-        @Volatile var backgroundSensorsGranted = true
-        @Volatile var lastRmssd = 0.0
 
-        /** From biofizic/state/live (compute-engine verdict for watch UI). */
-        @Volatile var arousalFused = -1f
-        @Volatile var arousal10 = -1
-        @Volatile var arousalConfidence = 0f
-        @Volatile var arousalLabel = "—"
-        @Volatile var motionGated = false
-        @Volatile var profileReady = false
-        @Volatile var calibrationPhase = ""
-        @Volatile var calibrationMessage = ""
-        @Volatile var signalOk = false
-        @Volatile var lastWindowSec = 0.0
+        // Environment
+        var displayOn: Boolean
+            get() = state.displayOn
+            set(value) { state.displayOn = value }
+        var backgroundSensorsGranted: Boolean
+            get() = state.backgroundSensorsGranted
+            set(value) { state.backgroundSensorsGranted = value }
 
-        private val _uiState = MutableStateFlow(UiState())
-        val uiState: StateFlow<UiState> = _uiState.asStateFlow()
+        // Server-side decision values
+        var arousalFused: Float
+            get() = state.arousalFused
+            set(value) { state.arousalFused = value }
+        var arousal10: Int
+            get() = state.arousal10
+            set(value) { state.arousal10 = value }
+        var arousalConfidence: Float
+            get() = state.arousalConfidence
+            set(value) { state.arousalConfidence = value }
+        var arousalLabel: String
+            get() = state.arousalLabel
+            set(value) { state.arousalLabel = value }
+        var motionGated: Boolean
+            get() = state.motionGated
+            set(value) { state.motionGated = value }
+        var profileReady: Boolean
+            get() = state.profileReady
+            set(value) { state.profileReady = value }
+        var calibrationPhase: String
+            get() = state.calibrationPhase
+            set(value) { state.calibrationPhase = value }
+        var calibrationMessage: String
+            get() = state.calibrationMessage
+            set(value) { state.calibrationMessage = value }
 
-        fun syncUiState() {
-            _uiState.value = UiState(
-                isRunning = isRunning,
-                isMqttConnected = isMqttConnected,
-                lastHr = lastHr,
-                arousalFused = arousalFused,
-                arousal10 = arousal10,
-                arousalLabel = arousalLabel,
-                arousalConfidence = arousalConfidence,
-                motionGated = motionGated,
-                profileReady = profileReady,
-                signalOk = signalOk,
-                lastWindowSec = lastWindowSec,
-                calibrationPhase = calibrationPhase,
-                calibrationMessage = calibrationMessage,
-            )
-        }
+        // Compose snapshot
+        val uiState: StateFlow<UiState> get() = state.uiState
+        fun syncUiState() = state.syncUiState()
 
         // Min beats and covered seconds required before the watch UI claims the
         // signal is good. Server-side thresholds are stricter and authoritative;
@@ -161,12 +222,6 @@ class SensorService : Service(), SensorEventListener {
         }
     }
 
-    private var sdkFlushLoopRunning = false
-    private var hrFlushLoopRunning = false
-    private var hrvPublishLoopRunning = false
-    private var liveWatchLoopRunning = false
-    private var mqttPublishLoopRunning = false
-
     @Volatile private var lastHrDataMs = 0L
     @Volatile private var lastHrBatchPoints = 0
     @Volatile private var lastHrBatchIbi = 0
@@ -174,63 +229,32 @@ class SensorService : Service(), SensorEventListener {
     private var lastHrPulseLogMs = 0L
     private var inForeground = false
 
-    private val sdkFlushRunnable = object : Runnable {
-        override fun run() {
-            if (!isRunning) {
-                sdkFlushLoopRunning = false
-                return
-            }
-            ppgTracker?.flush()
-            skinTempTracker?.flush()
-            accSdkTracker?.flush()
-            handler.postDelayed(this, mqttPublishIntervalMs)
-        }
-    }
-
-    private val hrFlushRunnable = object : Runnable {
-        override fun run() {
-            if (!isRunning) {
-                hrFlushLoopRunning = false
-                return
-            }
-            heartRateTracker?.flush()
-            logHrBatchIfDue()
-            logHrPulse()
-            handler.postDelayed(this, hrFlushIntervalMs)
-        }
-    }
-
-    private val hrvPublishRunnable = object : Runnable {
-        override fun run() {
-            if (!isRunning) {
-                hrvPublishLoopRunning = false
-                return
-            }
-            updateSignalStatus()
-            handler.postDelayed(this, hrvPublishIntervalMs)
-        }
-    }
-
-    private val liveWatchRunnable = object : Runnable {
-        override fun run() {
-            if (!isRunning) {
-                liveWatchLoopRunning = false
-                return
-            }
-            publishSensorBatches()
-            handler.postDelayed(this, LIVE_WATCH_INTERVAL_MS)
-        }
-    }
-
-    private val mqttPublishRunnable = object : Runnable {
-        override fun run() {
-            if (!isRunning) {
-                mqttPublishLoopRunning = false
-                return
-            }
-            logPeriodicStatus()
-            handler.postDelayed(this, mqttPublishIntervalMs)
-        }
+    // Owns the 5 periodic Runnables that used to live inline in this class.
+    // Constructed lazily because it captures `this` via callbacks.
+    private val publishScheduler: PublishScheduler by lazy {
+        PublishScheduler(
+            handler = handler,
+            isRunning = { isRunning },
+            mqttPublishIntervalMs = { mqttPublishIntervalMs },
+            hrFlushIntervalMs = { hrFlushIntervalMs },
+            hrvPublishIntervalMs = { hrvPublishIntervalMs },
+            liveWatchIntervalMs = LIVE_WATCH_INTERVAL_MS,
+            liveStreamEnabled = { liveStreamEnabled },
+            liveWatchEnabled = { liveWatchEnabled },
+            onSdkFlush = {
+                ppgTracker?.flush()
+                skinTempTracker?.flush()
+                accSdkTracker?.flush()
+            },
+            onHrFlush = {
+                heartRateTracker?.flush()
+                logHrBatchIfDue()
+                logHrPulse()
+            },
+            onPeriodicHrvLog = { updateSignalStatus() },
+            onLiveBatch = { publishSensorBatches() },
+            onStatusLog = { logPeriodicStatus() },
+        )
     }
 
     private fun updateDisplayState(on: Boolean) {
@@ -306,42 +330,9 @@ class SensorService : Service(), SensorEventListener {
         )
     }
 
-    private fun startPublishLoops() {
-        if (!sdkFlushLoopRunning) {
-            sdkFlushLoopRunning = true
-            handler.post(sdkFlushRunnable)
-        }
-        if (!hrFlushLoopRunning) {
-            hrFlushLoopRunning = true
-            handler.post(hrFlushRunnable)
-        }
-        if (!hrvPublishLoopRunning) {
-            hrvPublishLoopRunning = true
-            // Prima epocă după 30s (fereastra HRV plină), nu la pornire goală
-            handler.postDelayed(hrvPublishRunnable, hrvPublishIntervalMs)
-        }
-        if (liveStreamEnabled && liveWatchEnabled && !liveWatchLoopRunning) {
-            liveWatchLoopRunning = true
-            handler.post(liveWatchRunnable)
-        }
-        if (!mqttPublishLoopRunning) {
-            mqttPublishLoopRunning = true
-            handler.post(mqttPublishRunnable)
-        }
-    }
+    private fun startPublishLoops() = publishScheduler.start()
 
-    private fun stopPublishLoops() {
-        sdkFlushLoopRunning = false
-        hrFlushLoopRunning = false
-        hrvPublishLoopRunning = false
-        liveWatchLoopRunning = false
-        mqttPublishLoopRunning = false
-        handler.removeCallbacks(sdkFlushRunnable)
-        handler.removeCallbacks(hrFlushRunnable)
-        handler.removeCallbacks(hrvPublishRunnable)
-        handler.removeCallbacks(liveWatchRunnable)
-        handler.removeCallbacks(mqttPublishRunnable)
-    }
+    private fun stopPublishLoops() = publishScheduler.stop()
 
     // ══════════════════════════════════════════
     //  Samsung Health SDK – connection
@@ -857,63 +848,13 @@ class SensorService : Service(), SensorEventListener {
     // ══════════════════════════════════════════
     //  MQTT
     // ══════════════════════════════════════════
-    @Volatile private var mqttConnecting = false
 
     private fun connectMqtt() {
-        if (mqttConnecting) return
-        mqttConnecting = true
-        try {
-            if (::mqttClient.isInitialized) {
-                try {
-                    mqttClient.disconnect(0)
-                } catch (_: Exception) {}
-                try { mqttClient.close() } catch (_: Exception) {}
-            }
-            mqttClient = MqttClient(BROKER_URL, CLIENT_ID, MemoryPersistence())
-            val options = MqttConnectOptions().apply {
-                isCleanSession = true
-                connectionTimeout = 8
-                keepAliveInterval = 45
-                isAutomaticReconnect = false  // watchdog-ul gestionează reconectarea
-            }
-            mqttClient.setCallback(object : MqttCallback {
-                override fun connectionLost(cause: Throwable?) {
-                    isMqttConnected = false
-                    Log.w(TAG, "MQTT pierdut: ${cause?.message}")
-                    // Nu reconectăm direct — watchdog-ul va detecta și va apela connectMqtt()
-                }
-
-                override fun messageArrived(topic: String?, message: MqttMessage?) {
-                    if (message == null || topic == null) return
-                    try {
-                        val json = message.payload.decodeToString()
-                        when (topic) {
-                            // Retained bootstrap on reconnect (last epoch decision)
-                            // and the same channel that delivers fresh 30 s epochs.
-                            "biofizic/state" -> parseEpochStateMessage(json)
-                            "biofizic/state/live" -> parseStateLiveMessage(json)
-                            "biofizic/calibration/status" -> parseCalibrationStatus(json)
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "MQTT parse $topic: ${e.message}")
-                    }
-                }
-
-                override fun deliveryComplete(token: IMqttDeliveryToken?) {}
-            })
-            mqttClient.connect(options)
-            // QoS 1 on state so the retained bootstrap survives a reconnect.
-            mqttClient.subscribe("biofizic/state", 1)
-            mqttClient.subscribe("biofizic/state/live", 0)
-            mqttClient.subscribe("biofizic/calibration/status", 1)
+        if (mqttSession.connect()) {
             isMqttConnected = true
-            Log.i(TAG, "MQTT conectat la $BROKER_URL (+ state, state/live)")
             syncUiState()
-        } catch (e: Exception) {
+        } else {
             isMqttConnected = false
-            Log.e(TAG, "MQTT eroare conectare la $BROKER_URL: ${e.message}")
-        } finally {
-            mqttConnecting = false
         }
     }
 
@@ -1149,17 +1090,7 @@ class SensorService : Service(), SensorEventListener {
     }
 
     private fun publish(topic: String, payload: String, retain: Boolean = false) {
-        try {
-            if (::mqttClient.isInitialized && mqttClient.isConnected) {
-                mqttClient.publish(topic, MqttMessage(payload.toByteArray()).apply {
-                    qos = 0
-                    isRetained = retain
-                })
-                msgCount++
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "MQTT publish eroare pe $topic: ${e.message}")
-        }
+        mqttSession.publish(topic, payload, retain)
     }
 
     // ══════════════════════════════════════════
@@ -1175,13 +1106,15 @@ class SensorService : Service(), SensorEventListener {
                     wakeLock.acquire(WAKE_LOCK_TIMEOUT_MS)
                 }
 
-                // Verifica MQTT
-                val connected = ::mqttClient.isInitialized && mqttClient.isConnected
+                // Refresh MQTT status and reconnect if needed. The session
+                // coalesces concurrent attempts, so the watchdog can call
+                // connect freely without racing in-flight connects.
+                val connected = mqttSession.isAlive
                 isMqttConnected = connected
-                if (!connected && !mqttConnecting) {
-                    Log.w(TAG, "MQTT deconectat, reconectare...")
+                if (!connected) {
+                    Log.w(TAG, "MQTT disconnected, reconnecting")
                     connectMqtt()
-                    Thread.sleep(5_000)  // pauză după tentativă, indiferent de succes
+                    Thread.sleep(5_000)
                 }
 
                 // Verifica Samsung SDK
@@ -1259,9 +1192,7 @@ class SensorService : Service(), SensorEventListener {
         resetSdkState()
 
         // MQTT
-        if (::mqttClient.isInitialized && mqttClient.isConnected) {
-            try { mqttClient.disconnect() } catch (_: Exception) {}
-        }
+        mqttSession.disconnect()
         isMqttConnected = false
 
         activeSensors = 0

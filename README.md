@@ -44,6 +44,15 @@ Default if unset: `tcp://localhost:1883` (via `R.string.mqtt_broker_url` in `bui
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
+## Run unit tests
+
+JVM unit tests cover `AcquisitionAssembler` (atomic sync: IBI timestamp
+reconstruction, ts_anchor, drain semantics, motion stats window cutoff).
+
+```bash
+./gradlew :app:testDebugUnitTest
+```
+
 ## MQTT topics published
 
 | Topic | Rate | Content |

@@ -68,4 +68,14 @@ dependencies {
     debugImplementation(libs.ui.test.manifest)
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar"))))
     implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
+
+    // Unit tests run on the JVM (no Android runtime). They cover atomic-sync
+    // logic in AcquisitionAssembler: ts_anchor, IBI timestamp reconstruction,
+    // motion stats, drain semantics.
+    testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
+    testImplementation("org.jetbrains.kotlin:kotlin-test")
+}
+
+tasks.withType<Test>().configureEach {
+    useJUnitPlatform()
 }

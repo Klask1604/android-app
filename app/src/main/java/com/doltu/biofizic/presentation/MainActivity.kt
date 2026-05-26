@@ -313,12 +313,22 @@ private fun WatchFaceContent(
                     onLongClick = onLongPressRecalibrate,
                 ),
         ) {
+            // Target ring fill. Smoothing of the integer arousal_10 itself
+            // happens server-side via LIVE_AROUSAL_HYSTERESIS_TICKS; here we
+            // only animate the fill so that the rare legitimate flip does not
+            // look like a sudden jump.
+            val targetProgress = when {
+                !isRunning -> 0f
+                hasVerdict -> arousalFused / 10f
+                else -> 0f
+            }
+            val animatedProgress by animateFloatAsState(
+                targetValue = targetProgress,
+                animationSpec = tween(durationMillis = 500),
+                label = "arousal_ring",
+            )
             ArousalGauge(
-                progress = when {
-                    !isRunning -> 0f
-                    hasVerdict -> arousalFused / 10f
-                    else -> 0f
-                },
+                progress = animatedProgress,
                 accent = accent,
                 modifier = Modifier.fillMaxSize(),
             )
