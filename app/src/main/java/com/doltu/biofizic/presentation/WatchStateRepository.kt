@@ -66,6 +66,8 @@ object WatchStateRepository {
     @Volatile var profileReady: Boolean = false
     @Volatile var calibrationPhase: String = ""
     @Volatile var calibrationMessage: String = ""
+    // "preliminary" | "calibrated" — see UiState.decisionFidelity.
+    @Volatile var decisionFidelity: String = "calibrated"
 
     // ----- Compose-visible snapshot -----
     private val _uiState = MutableStateFlow(UiState())
@@ -88,6 +90,7 @@ object WatchStateRepository {
             lastWindowSec = lastWindowSec,
             calibrationPhase = calibrationPhase,
             calibrationMessage = calibrationMessage,
+            decisionFidelity = decisionFidelity,
         )
     }
 }

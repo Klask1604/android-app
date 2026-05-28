@@ -18,4 +18,10 @@ data class UiState(
     val lastWindowSec: Double = 0.0,
     val calibrationPhase: String = "",
     val calibrationMessage: String = "",
+    // Server-side honesty flag: "preliminary" means arousal_10 came from the
+    // Kubios population zones (no personal baseline yet) and confidence is
+    // capped at 0.5; "calibrated" means it came from the personal-z CDF.
+    // UI uses this to show a small badge so a preliminary verdict isn't
+    // confused with a fully calibrated one.
+    val decisionFidelity: String = "calibrated",
 )

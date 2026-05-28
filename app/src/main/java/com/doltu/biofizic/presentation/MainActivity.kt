@@ -251,6 +251,7 @@ fun BiofizicWatchApp() {
                         motionGated = uiState.motionGated,
                         profileReady = uiState.profileReady,
                         signalOk = uiState.signalOk,
+                        decisionFidelity = uiState.decisionFidelity,
                         windowSec = uiState.lastWindowSec.toFloat(),
                         calibrating = uiState.calibrationPhase == "collecting",
                         calMessage = uiState.calibrationMessage,
@@ -440,6 +441,7 @@ private fun WatchFaceContent(
     motionGated: Boolean,
     profileReady: Boolean,
     signalOk: Boolean,
+    decisionFidelity: String,
     windowSec: Float,
     calibrating: Boolean,
     calMessage: String,
@@ -471,6 +473,8 @@ private fun WatchFaceContent(
             profileReady = profileReady && !calibrating,
             signalOk = signalOk,
             calibrating = calibrating,
+            decisionFidelity = decisionFidelity,
+            hasVerdict = hasVerdict,
         )
 
         Spacer(modifier = Modifier.height(6.dp))
@@ -640,16 +644,27 @@ private fun CompactStatusLine(
     profileReady: Boolean,
     signalOk: Boolean,
     calibrating: Boolean = false,
+    decisionFidelity: String = "calibrated",
+    hasVerdict: Boolean = false,
 ) {
     val liveColor = when {
         !isRunning -> AccentIdle
         mqttOk -> AccentActive
         else -> AccentHigh
     }
+    // Server-side fidelity is the source of truth once a verdict exists.
+    // "preliminary" means we already show arousal_10 (Kubios population
+    // fallback) — display it as motion-yellow with "~" suffix so the user
+    // sees the verdict immediately AND knows it isn't personalised yet.
+    // "calibrated" + profileReady → green "OK". This replaces the old
+    // 6-min spinner that hid arousal until baseline locked.
+    val isPreliminaryVerdict = hasVerdict && decisionFidelity == "preliminary"
     val profColor = when {
         !isRunning -> AccentIdle
         !mqttOk -> AccentIdle
-        profileReady -> AccentActive
+        calibrating -> AccentMotion
+        profileReady && decisionFidelity == "calibrated" -> AccentActive
+        isPreliminaryVerdict -> AccentMotion
         else -> AccentMotion
     }
     val liveLabel = when {
@@ -661,7 +676,8 @@ private fun CompactStatusLine(
         !isRunning -> "Profil"
         !mqttOk -> "Profil-"
         calibrating -> "Calibr…"
-        profileReady -> "Profil OK"
+        profileReady && decisionFidelity == "calibrated" -> "Profil OK"
+        isPreliminaryVerdict -> "Profil~"
         else -> "Profil…"
     }
     val sigColor = when {

@@ -98,9 +98,17 @@ class SensorService : Service(), SensorEventListener {
 
         // Raw full-rate firehose for testing: every sensor DataPoint, every value
         // key the SDK exposes, published as-is on a separate topic — independent of
-        // all production toggles/aggregation. Set false to stop the flood.
-        const val PUBLISH_TEST_DUMP = true
+        // all production toggles/aggregation. Default OFF in production. Flip ON
+        // for a research session (cardiac-comparator, NK shadow, etc) and rebuild.
+        const val PUBLISH_TEST_DUMP = false
         const val TEST_TOPIC = "biofizic/test"
+
+        // Confirmed empirically on Galaxy Watch 7: starting PPG_ON_DEMAND in
+        // parallel with HEART_RATE_CONTINUOUS stops the HR tracker from
+        // delivering IBI bursts. That starves the server's HRV pipeline (empty
+        // ibi_buffer → no baseline lock → watch UI stuck on "Profil…"). Keep
+        // OFF except when actively running the cardiac-comparator experiment.
+        const val START_PPG_ON_DEMAND = false
 
         // Pending self-report to send as a calibration once MQTT is connected.
         @Volatile var pendingReportedArousal: Double = Double.NaN
@@ -220,6 +228,9 @@ class SensorService : Service(), SensorEventListener {
         var calibrationMessage: String
             get() = state.calibrationMessage
             set(value) { state.calibrationMessage = value }
+        var decisionFidelity: String
+            get() = state.decisionFidelity
+            set(value) { state.decisionFidelity = value }
 
         // Compose snapshot
         val uiState: StateFlow<UiState> get() = state.uiState
@@ -814,9 +825,12 @@ class SensorService : Service(), SensorEventListener {
             Log.w(TAG, "✗ ECG_ON_DEMAND indisponibil pe acest dispozitiv")
         }
 
-        // PPG on-demand @100 Hz — TEST ONLY. May conflict with PPG_CONTINUOUS
-        // (same optical sensor); if so, onError logs it and we just skip it.
-        if (PUBLISH_TEST_DUMP && HealthTrackerType.PPG_ON_DEMAND in capabilities) {
+        // PPG on-demand @100 Hz — TEST ONLY. Gated by START_PPG_ON_DEMAND
+        // because on Galaxy Watch 7 this tracker silently blocks
+        // HEART_RATE_CONTINUOUS from emitting IBI bursts, starving the server
+        // HRV pipeline. Enable only for the cardiac-comparator experiment.
+        if (PUBLISH_TEST_DUMP && START_PPG_ON_DEMAND
+            && HealthTrackerType.PPG_ON_DEMAND in capabilities) {
             ppgOnDemandTracker = obtainPpgTracker(HealthTrackerType.PPG_ON_DEMAND)
             if (ppgOnDemandTracker != null) {
                 handler.post { ppgOnDemandTracker?.setEventListener(ppgOnDemandListener) }
@@ -1149,6 +1163,14 @@ class SensorService : Service(), SensorEventListener {
         arousalLabel = obj.optString("emotion", "—").ifEmpty { "—" }
         if (obj.has("profile_ready")) {
             profileReady = obj.optBoolean("profile_ready", profileReady)
+        }
+        // Server honesty flag: "preliminary" (Kubios population fallback,
+        // confidence capped at 0.5) vs "calibrated" (personal-z CDF). Empty
+        // means an older server build — fall back to assuming calibrated so
+        // we never accidentally label real calibrated verdicts as preliminary.
+        val fidelity = obj.optString("decision_fidelity", "")
+        if (fidelity.isNotEmpty()) {
+            decisionFidelity = fidelity
         }
         val motionState = obj.optString("motion_state", "")
         if (motionState.isNotEmpty()) {
