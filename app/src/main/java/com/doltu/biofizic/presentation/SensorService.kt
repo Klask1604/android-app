@@ -72,6 +72,9 @@ class SensorService : Service(), SensorEventListener {
     private var ppgTracker: HealthTracker? = null
     private var skinTempTracker: HealthTracker? = null
     private var accSdkTracker: HealthTracker? = null
+    private var ecgTracker: HealthTracker? = null  // test-only, on-demand (hold finger)
+    private var ppgOnDemandTracker: HealthTracker? = null  // test-only, 100 Hz raw
+    private var skinTempOnDemandTracker: HealthTracker? = null  // test-only
     private val handler = Handler(Looper.getMainLooper())
 
     // ── Wake lock ──
@@ -92,6 +95,12 @@ class SensorService : Service(), SensorEventListener {
         // Self-reported arousal in [0,1] from the watch questionnaire; anchors
         // where the new baseline sits on the arousal scale.
         const val EXTRA_REPORTED_AROUSAL = "com.doltu.biofizic.EXTRA_REPORTED_AROUSAL"
+
+        // Raw full-rate firehose for testing: every sensor DataPoint, every value
+        // key the SDK exposes, published as-is on a separate topic — independent of
+        // all production toggles/aggregation. Set false to stop the flood.
+        const val PUBLISH_TEST_DUMP = true
+        const val TEST_TOPIC = "biofizic/test"
 
         // Pending self-report to send as a calibration once MQTT is connected.
         @Volatile var pendingReportedArousal: Double = Double.NaN
@@ -379,6 +388,7 @@ class SensorService : Service(), SensorEventListener {
     /** HR + IBI */
     private val heartRateListener = object : HealthTracker.TrackerEventListener {
         override fun onDataReceived(dataPoints: List<DataPoint>) {
+            dumpHrTest(dataPoints)
             val recvMs = System.currentTimeMillis()
             val gapMs = if (lastHrDataMs > 0L) recvMs - lastHrDataMs else 0L
             lastHrDataMs = recvMs
@@ -442,6 +452,7 @@ class SensorService : Service(), SensorEventListener {
     /** PPG raw – green, IR, red (SDK: ~25 Hz continuous) */
     private val ppgListener = object : HealthTracker.TrackerEventListener {
         override fun onDataReceived(dataPoints: List<DataPoint>) {
+            dumpPpgTest(dataPoints)
             enqueuePpg(dataPoints)
         }
         override fun onFlushCompleted() {}
@@ -456,9 +467,44 @@ class SensorService : Service(), SensorEventListener {
         }
     }
 
+    /** ECG raw @ 500 Hz — TEST ONLY, on-demand (user must hold a finger on the
+     *  button; data flows only while LEAD_OFF == 0). Dumped to biofizic/test/ecg. */
+    private val ecgListener = object : HealthTracker.TrackerEventListener {
+        override fun onDataReceived(dataPoints: List<DataPoint>) {
+            dumpEcgTest(dataPoints)
+        }
+        override fun onFlushCompleted() {}
+        override fun onError(e: HealthTracker.TrackerError) {
+            Log.w(TAG, "ECG tracker eroare: ${e.name}")
+        }
+    }
+
+    /** PPG on-demand @100 Hz — TEST ONLY → biofizic/test/ppg_ondemand. */
+    private val ppgOnDemandListener = object : HealthTracker.TrackerEventListener {
+        override fun onDataReceived(dataPoints: List<DataPoint>) {
+            dumpPpgOnDemandTest(dataPoints)
+        }
+        override fun onFlushCompleted() {}
+        override fun onError(e: HealthTracker.TrackerError) {
+            Log.w(TAG, "PPG on-demand eroare: ${e.name}")
+        }
+    }
+
+    /** Skin temperature on-demand — TEST ONLY → biofizic/test/skin_temp_ondemand. */
+    private val skinTempOnDemandListener = object : HealthTracker.TrackerEventListener {
+        override fun onDataReceived(dataPoints: List<DataPoint>) {
+            dumpSkinTempOnDemandTest(dataPoints)
+        }
+        override fun onFlushCompleted() {}
+        override fun onError(e: HealthTracker.TrackerError) {
+            Log.w(TAG, "Skin temp on-demand eroare: ${e.name}")
+        }
+    }
+
     /** Skin temperature */
     private val skinTempListener = object : HealthTracker.TrackerEventListener {
         override fun onDataReceived(dataPoints: List<DataPoint>) {
+            dumpSkinTempTest(dataPoints)
             enqueueSkinTemp(dataPoints)
         }
         override fun onFlushCompleted() {}
@@ -471,6 +517,7 @@ class SensorService : Service(), SensorEventListener {
     /** Accelerometer SDK – raw @ 25 Hz */
     private val accSdkListener = object : HealthTracker.TrackerEventListener {
         override fun onDataReceived(dataPoints: List<DataPoint>) {
+            dumpAccTest(dataPoints)
             enqueueAcc(dataPoints)
         }
         override fun onFlushCompleted() {}
@@ -754,6 +801,40 @@ class SensorService : Service(), SensorEventListener {
             Log.w(TAG, "✗ Skin temp indisponibil (lipsește CONTINUOUS și ON_DEMAND)")
         }
 
+        // ECG — TEST ONLY: on-demand, requires the user to hold a finger on the
+        // button. Started only with the test firehose on; raw 500 Hz → biofizic/test/ecg.
+        if (PUBLISH_TEST_DUMP && HealthTrackerType.ECG_ON_DEMAND in capabilities) {
+            ecgTracker = obtainTracker(HealthTrackerType.ECG_ON_DEMAND)
+            if (ecgTracker != null) {
+                handler.post { ecgTracker?.setEventListener(ecgListener) }
+                count++
+                Log.i(TAG, "✓ ECG tracker pornit (ON_DEMAND, test — ține degetul pe buton)")
+            }
+        } else if (PUBLISH_TEST_DUMP) {
+            Log.w(TAG, "✗ ECG_ON_DEMAND indisponibil pe acest dispozitiv")
+        }
+
+        // PPG on-demand @100 Hz — TEST ONLY. May conflict with PPG_CONTINUOUS
+        // (same optical sensor); if so, onError logs it and we just skip it.
+        if (PUBLISH_TEST_DUMP && HealthTrackerType.PPG_ON_DEMAND in capabilities) {
+            ppgOnDemandTracker = obtainPpgTracker(HealthTrackerType.PPG_ON_DEMAND)
+            if (ppgOnDemandTracker != null) {
+                handler.post { ppgOnDemandTracker?.setEventListener(ppgOnDemandListener) }
+                count++
+                Log.i(TAG, "✓ PPG on-demand pornit (100 Hz, test)")
+            }
+        }
+
+        // Skin temperature on-demand — TEST ONLY (single-shot vs the continuous one).
+        if (PUBLISH_TEST_DUMP && HealthTrackerType.SKIN_TEMPERATURE_ON_DEMAND in capabilities) {
+            skinTempOnDemandTracker = obtainTracker(HealthTrackerType.SKIN_TEMPERATURE_ON_DEMAND)
+            if (skinTempOnDemandTracker != null) {
+                handler.post { skinTempOnDemandTracker?.setEventListener(skinTempOnDemandListener) }
+                count++
+                Log.i(TAG, "✓ Skin temp on-demand pornit (test)")
+            }
+        }
+
         if (HealthTrackerType.ACCELEROMETER_CONTINUOUS in capabilities) {
             accSdkTracker = obtainTracker(HealthTrackerType.ACCELEROMETER_CONTINUOUS)
             if (accSdkTracker != null) {
@@ -865,6 +946,12 @@ class SensorService : Service(), SensorEventListener {
                         event.values[2] * event.values[2]
                 ).toDouble()
                 assembler.addGyroSample(ts, gMag)
+                if (PUBLISH_TEST_DUMP) {
+                    publishTestDump(
+                        "gyroscope",
+                        """[{"ts":$ts,"x":${event.values[0]},"y":${event.values[1]},"z":${event.values[2]}}]""",
+                    )
+                }
             }
         }
     }
@@ -1147,6 +1234,121 @@ class SensorService : Service(), SensorEventListener {
     }
 
     // ══════════════════════════════════════════
+    //  TEST firehose — raw, full-rate, all params, on biofizic/test
+    // ══════════════════════════════════════════
+
+    /** Publish one full-resolution batch (all DataPoints from a callback) on a
+     *  per-sensor topic: biofizic/test/<sensor>. Numeric-only payloads. */
+    private fun publishTestDump(sensor: String, samplesJson: String) {
+        if (!PUBLISH_TEST_DUMP || !isMqttConnected) return
+        publish(
+            "$TEST_TOPIC/$sensor",
+            """{"recv_ms":${System.currentTimeMillis()},"samples":$samplesJson}""",
+        )
+    }
+
+    private fun dumpHrTest(dataPoints: List<DataPoint>) {
+        if (!PUBLISH_TEST_DUMP) return
+        val sb = StringBuilder("[")
+        for ((i, dp) in dataPoints.withIndex()) {
+            if (i > 0) sb.append(',')
+            val hr = dp.getValue(ValueKey.HeartRateSet.HEART_RATE)
+            val st = dp.getValue(ValueKey.HeartRateSet.HEART_RATE_STATUS)
+            val ibi = dp.getValue(ValueKey.HeartRateSet.IBI_LIST)
+            val ibiSt = dp.getValue(ValueKey.HeartRateSet.IBI_STATUS_LIST)
+            sb.append("""{"ts":${dp.timestamp},"hr":$hr,"hr_status":$st,""")
+            sb.append(""""ibi":${ibi?.toString() ?: "[]"},"ibi_status":${ibiSt?.toString() ?: "[]"}}""")
+        }
+        sb.append(']')
+        publishTestDump("heart_rate_continuous", sb.toString())
+    }
+
+    private fun dumpPpgTest(dataPoints: List<DataPoint>) {
+        if (!PUBLISH_TEST_DUMP) return
+        val sb = StringBuilder("[")
+        for ((i, dp) in dataPoints.withIndex()) {
+            if (i > 0) sb.append(',')
+            val g = dp.getValue(ValueKey.PpgSet.PPG_GREEN)
+            val ir = dp.getValue(ValueKey.PpgSet.PPG_IR)
+            val red = try { dp.getValue(ValueKey.PpgSet.PPG_RED).toString() } catch (e: Exception) { "null" }
+            sb.append("""{"ts":${dp.timestamp},"green":$g,"ir":$ir,"red":$red}""")
+        }
+        sb.append(']')
+        publishTestDump("ppg_continuous", sb.toString())
+    }
+
+    private fun dumpAccTest(dataPoints: List<DataPoint>) {
+        if (!PUBLISH_TEST_DUMP) return
+        val sb = StringBuilder("[")
+        for ((i, dp) in dataPoints.withIndex()) {
+            if (i > 0) sb.append(',')
+            val x = dp.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_X)
+            val y = dp.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_Y)
+            val z = dp.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_Z)
+            sb.append("""{"ts":${dp.timestamp},"x":$x,"y":$y,"z":$z}""")
+        }
+        sb.append(']')
+        publishTestDump("accelerometer_continuous", sb.toString())
+    }
+
+    private fun dumpEcgTest(dataPoints: List<DataPoint>) {
+        if (!PUBLISH_TEST_DUMP) return
+        val sb = StringBuilder("[")
+        for ((i, dp) in dataPoints.withIndex()) {
+            if (i > 0) sb.append(',')
+            val mv = dp.getValue(ValueKey.EcgSet.ECG_MV)
+            val lead = dp.getValue(ValueKey.EcgSet.LEAD_OFF)
+            val seq = dp.getValue(ValueKey.EcgSet.SEQUENCE)
+            val pg = dp.getValue(ValueKey.EcgSet.PPG_GREEN)
+            sb.append("""{"ts":${dp.timestamp},"ecg_mv":$mv,"lead_off":$lead,"seq":$seq,"ppg_green":$pg}""")
+        }
+        sb.append(']')
+        publishTestDump("ecg", sb.toString())
+    }
+
+    private fun dumpPpgOnDemandTest(dataPoints: List<DataPoint>) {
+        if (!PUBLISH_TEST_DUMP) return
+        val sb = StringBuilder("[")
+        for ((i, dp) in dataPoints.withIndex()) {
+            if (i > 0) sb.append(',')
+            val g = dp.getValue(ValueKey.PpgSet.PPG_GREEN)
+            val ir = dp.getValue(ValueKey.PpgSet.PPG_IR)
+            val red = try { dp.getValue(ValueKey.PpgSet.PPG_RED).toString() } catch (e: Exception) { "null" }
+            sb.append("""{"ts":${dp.timestamp},"green":$g,"ir":$ir,"red":$red}""")
+        }
+        sb.append(']')
+        publishTestDump("ppg_ondemand", sb.toString())
+    }
+
+    private fun dumpSkinTempOnDemandTest(dataPoints: List<DataPoint>) {
+        if (!PUBLISH_TEST_DUMP) return
+        val sb = StringBuilder("[")
+        for ((i, dp) in dataPoints.withIndex()) {
+            if (i > 0) sb.append(',')
+            val skin = dp.getValue(ValueKey.SkinTemperatureSet.OBJECT_TEMPERATURE)
+            val amb = dp.getValue(ValueKey.SkinTemperatureSet.AMBIENT_TEMPERATURE)
+            val st = dp.getValue(ValueKey.SkinTemperatureSet.STATUS)
+            sb.append("""{"ts":${dp.timestamp},"object_temp":$skin,"ambient_temp":$amb,"status":$st}""")
+        }
+        sb.append(']')
+        publishTestDump("skin_temp_ondemand", sb.toString())
+    }
+
+    private fun dumpSkinTempTest(dataPoints: List<DataPoint>) {
+        if (!PUBLISH_TEST_DUMP) return
+        val sb = StringBuilder("[")
+        for ((i, dp) in dataPoints.withIndex()) {
+            if (i > 0) sb.append(',')
+            val skin = dp.getValue(ValueKey.SkinTemperatureSet.OBJECT_TEMPERATURE)
+            val amb = dp.getValue(ValueKey.SkinTemperatureSet.AMBIENT_TEMPERATURE)
+            val st = dp.getValue(ValueKey.SkinTemperatureSet.STATUS)
+            sb.append("""{"ts":${dp.timestamp},"object_temp":$skin,"ambient_temp":$amb,"status":$st}""")
+        }
+        sb.append(']')
+        publishTestDump("skin_temperature", sb.toString())
+    }
+
+    // ══════════════════════════════════════════
     //  Watchdog – reconectare MQTT + SDK
     // ══════════════════════════════════════════
     private fun startWatchdog() {
@@ -1240,6 +1442,9 @@ class SensorService : Service(), SensorEventListener {
         ppgTracker?.unsetEventListener()
         skinTempTracker?.unsetEventListener()
         accSdkTracker?.unsetEventListener()
+        ecgTracker?.unsetEventListener()
+        ppgOnDemandTracker?.unsetEventListener()
+        skinTempOnDemandTracker?.unsetEventListener()
         healthTrackingService?.disconnectService()
         healthTrackingService = null
         resetSdkState()
