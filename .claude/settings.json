@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew :app:testDebugUnitTest --tests \"com.doltu.biofizic.acquisition.AcquisitionAssemblerTest\")",
+      "Bash(./venv/Scripts/python.exe -m pytest tests/test_signal.py tests/test_reference_hrv.py tests/test_artifact_correction.py tests/test_windows.py -q)"
+    ]
+  }
+}

@@ -24,8 +24,15 @@ object IbiSignalFilter {
     const val MIN_IBI_MS = 300
     const val MAX_IBI_MS = 2_000
 
+    // Empirically: Samsung's HR_CONTINUOUS marks bad beats with status == -1 in
+    // the dataset's IBI_STATUS_LIST (verified on GalaxyPPG and our own live
+    // sessions — typical -1 intervals are 260 ms or 1600 ms, physiologically
+    // impossible). Earlier this filter accepted -1 thinking Samsung was just
+    // signalling "low confidence" on a still-usable beat; that was wrong.
+    // Rejecting -1 cuts the published artifact_rate roughly in half on motion
+    // and keeps w30 RMSSD inside the physiological band.
     fun isStatusOk(status: Int?): Boolean =
-        status == null || status == 0 || status == -1
+        status == null || status == 0
 
     fun isPhysiological(ibiMs: Int): Boolean = ibiMs in MIN_IBI_MS..MAX_IBI_MS
 
@@ -50,6 +57,43 @@ object IbiSignalFilter {
         if (!isStatusOk(status)) return null
         val norm = normalizeIbiMs(rawIbiMs, hrBpm)
         return if (isPhysiological(norm)) norm else null
+    }
+
+    /**
+     * Outcome of evaluating one raw beat WITHOUT discarding it: the normalized
+     * duration (always, so timestamp reconstruction can advance the clock even
+     * over a rejected beat) plus whether the beat is accepted for HRV.
+     *
+     * Why we keep rejected durations: HR ships beats in bursts and we rebuild
+     * per-beat timestamps by walking back from an anchor. If we drop a rejected
+     * beat entirely, the two surviving neighbours look consecutive (their
+     * timestamps end up [interval] apart) and a successive difference is taken
+     * ACROSS the gap, inflating RMSSD. By advancing the reconstructed clock over
+     * the rejected beat's duration the gap stays visible, so the server's
+     * timestamp-coherence check (and the on-watch one) correctly skips that pair.
+     */
+    data class BeatEval(val normalizedMs: Int, val accepted: Boolean)
+
+    /**
+     * Evaluate a raw beat, returning a best-effort duration even when rejected.
+     * A status-rejected beat still carries a duration estimate: the normalized
+     * raw value when it lands in a plausible band, otherwise the expected IBI
+     * from HR (60000/hr), otherwise 0 (clock simply does not advance — no worse
+     * than today's behaviour).
+     */
+    fun evaluateBeat(rawIbiMs: Int, status: Int?, hrBpm: Int): BeatEval {
+        val norm = normalizeIbiMs(rawIbiMs, hrBpm)
+        val accepted = isStatusOk(status) && isPhysiological(norm)
+        if (accepted) return BeatEval(norm, true)
+        // Rejected: pick the most defensible duration so the clock advances by a
+        // realistic amount across the gap.
+        val duration = when {
+            isPhysiological(norm) -> norm                       // physiological but status-flagged
+            norm in 30..MAX_IBI_MS -> norm                      // scaled into a plausible range
+            hrBpm > 0 -> (60_000 / hrBpm).coerceIn(MIN_IBI_MS, MAX_IBI_MS)
+            else -> 0
+        }
+        return BeatEval(duration, false)
     }
 }
 

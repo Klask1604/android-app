@@ -1,7 +1,9 @@
 package com.doltu.biofizic.acquisition
 
+import com.doltu.biofizic.signal.IbiSignalFilter
 import com.doltu.biofizic.signal.IbiWindowEntry
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -85,6 +87,74 @@ class AcquisitionAssemblerTest {
         val (ts, source) = a.buildIbiTimestamps(listOf(800), dpNs, recv)
         assertEquals("dp_timestamp", source)
         assertEquals(expectedMs, ts[0])
+    }
+
+    // -----------------------------------------------------------------------
+    // buildIbiTimestampsWithGaps: rejected beats leave a visible time gap so
+    // RMSSD is not inflated across a dropped beat.
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `gaps reconstruction emits timestamps only for accepted beats`() {
+        val a = assembler()
+        val dpMs = 1_716_000_000_000L
+        val recv = dpMs + 500
+        val evals = listOf(
+            IbiSignalFilter.BeatEval(820, accepted = true),
+            IbiSignalFilter.BeatEval(260, accepted = false),  // rejected -1 beat
+            IbiSignalFilter.BeatEval(810, accepted = true),
+        )
+        val (durations, timestamps, source) = a.buildIbiTimestampsWithGaps(evals, dpMs, recv)
+        assertEquals("dp_timestamp", source)
+        // Only the two accepted beats produce entries.
+        assertEquals(listOf(820, 810), durations.toList())
+        // Last accepted beat anchored on dpMs.
+        assertEquals(dpMs, timestamps[1])
+        // The first accepted beat's timestamp is pushed back by the REJECTED
+        // beat's duration too (810 + 260), not just by 810. This is the gap
+        // that keeps the two survivors from looking consecutive.
+        assertEquals(dpMs - 810 - 260, timestamps[0])
+    }
+
+    @Test
+    fun `gap leaves the surviving pair timestamp-incoherent so the server skips it`() {
+        val a = assembler()
+        val dpMs = 1_716_000_000_000L
+        val evals = listOf(
+            IbiSignalFilter.BeatEval(800, accepted = true),
+            IbiSignalFilter.BeatEval(600, accepted = false),  // dropped beat
+            IbiSignalFilter.BeatEval(810, accepted = true),
+        )
+        val (_, ts, _) = a.buildIbiTimestampsWithGaps(evals, dpMs, dpMs + 1)
+        // The inter-beat gap between the two survivors is 810 + 600 = 1410 ms,
+        // which differs from the later beat's IBI (810 ms) by 600 ms — far
+        // above MAX_TIMESTAMP_IBI_MISMATCH_MS (250). The server's coherence
+        // check will therefore drop this pair from RMSSD, which is the point.
+        val gap = ts[1] - ts[0]
+        assertEquals(1410L, gap)
+        assertTrue(kotlin.math.abs(gap - 810) > 250)
+    }
+
+    @Test
+    fun `evaluateBeat keeps a duration for a status-rejected beat`() {
+        // Status -1 marks a bad beat; we still want a plausible duration so the
+        // reconstruction clock advances over it.
+        val rejected = IbiSignalFilter.evaluateBeat(rawIbiMs = 820, status = -1, hrBpm = 72)
+        assertFalse(rejected.accepted)
+        assertEquals(820, rejected.normalizedMs)  // physiological value retained as duration
+
+        val accepted = IbiSignalFilter.evaluateBeat(rawIbiMs = 810, status = 0, hrBpm = 72)
+        assertTrue(accepted.accepted)
+        assertEquals(810, accepted.normalizedMs)
+    }
+
+    @Test
+    fun `evaluateBeat falls back to HR-derived duration when value is unusable`() {
+        // A wildly out-of-band rejected beat: use 60000/hr so the clock still
+        // advances by a realistic amount.
+        val r = IbiSignalFilter.evaluateBeat(rawIbiMs = 5_000, status = -1, hrBpm = 60)
+        assertFalse(r.accepted)
+        assertEquals(1_000, r.normalizedMs)  // 60000 / 60 bpm
     }
 
     // -----------------------------------------------------------------------

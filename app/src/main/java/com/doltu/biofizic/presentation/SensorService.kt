@@ -417,23 +417,27 @@ class SensorService : Service(), SensorEventListener {
                 val ibiStatusList = dp.getValue(ValueKey.HeartRateSet.IBI_STATUS_LIST)
                 if (ibiList != null && status == 1) {
                     val hrForNorm = if (hr > 0) hr else lastHr
-                    val accepted = mutableListOf<Int>()
+                    // Evaluate EVERY beat (keep rejected ones too) so timestamp
+                    // reconstruction can advance the clock over rejected beats and
+                    // leave a visible gap — otherwise the two surviving neighbours
+                    // look consecutive and RMSSD is inflated across the dropped beat.
+                    val evals = ArrayList<IbiSignalFilter.BeatEval>(ibiList.size)
                     for (i in ibiList.indices) {
-                        val norm = IbiSignalFilter.acceptBeat(
-                            ibiList[i],
-                            ibiStatusList?.getOrNull(i),
-                            hrForNorm,
-                        ) ?: continue
-                        accepted.add(norm)
-                    }
-                    if (accepted.isNotEmpty()) {
-                        val (timestamps, source) = assembler.buildIbiTimestamps(
-                            accepted, dp.timestamp, recvMs,
+                        evals.add(
+                            IbiSignalFilter.evaluateBeat(
+                                ibiList[i],
+                                ibiStatusList?.getOrNull(i),
+                                hrForNorm,
+                            )
                         )
-                        logIbiTimestampDecision(dp.timestamp, recvMs, source, accepted.size)
-                        val entries = ArrayList<IbiWindowEntry>(accepted.size)
-                        for (i in accepted.indices) {
-                            entries.add(IbiWindowEntry(accepted[i], timestamps[i], source))
+                    }
+                    val (durations, timestamps, source) =
+                        assembler.buildIbiTimestampsWithGaps(evals, dp.timestamp, recvMs)
+                    if (durations.isNotEmpty()) {
+                        logIbiTimestampDecision(dp.timestamp, recvMs, source, durations.size)
+                        val entries = ArrayList<IbiWindowEntry>(durations.size)
+                        for (i in durations.indices) {
+                            entries.add(IbiWindowEntry(durations[i], timestamps[i], source))
                         }
                         assembler.addIbiBatch(entries)
                         batchIbi += entries.size

@@ -192,6 +192,48 @@ class AcquisitionAssembler(
         return Pair(timestamps, source)
     }
 
+    /**
+     * Like [buildIbiTimestamps] but walks back through EVERY beat in the burst
+     * (accepted and rejected), advancing the reconstructed clock by each beat's
+     * duration so a rejected beat leaves a visible time gap. Emits a timestamp
+     * only for accepted beats. This keeps successive-difference pairs that
+     * straddle a dropped beat from looking consecutive, so RMSSD is not inflated
+     * across discontinuities (the server's timestamp-coherence check then skips
+     * those pairs). Returns the accepted durations paired with their timestamps.
+     */
+    fun buildIbiTimestampsWithGaps(
+        beats: List<com.doltu.biofizic.signal.IbiSignalFilter.BeatEval>,
+        dpTs: Long,
+        recvMs: Long,
+    ): Triple<IntArray, LongArray, String> {
+        val normDp = normalizeSensorTimestampMs(dpTs)
+        val useDp = isEpochMillis(normDp)
+        val anchor = if (useDp) normDp else recvMs
+        val source = if (useDp) "dp_timestamp" else "reconstructed"
+
+        // First pass (backwards): assign a wall-clock timestamp to the END of
+        // every beat, advancing the clock by each beat's (possibly rejected)
+        // duration. Rejected beats consume time but produce no entry.
+        val endTsPerBeat = LongArray(beats.size)
+        var endTs = anchor
+        for (i in beats.indices.reversed()) {
+            endTsPerBeat[i] = endTs
+            endTs -= beats[i].normalizedMs
+        }
+
+        // Second pass (forwards): keep only accepted beats, preserving the
+        // timestamps that now reflect the real gaps left by rejected beats.
+        val accDur = ArrayList<Int>(beats.size)
+        val accTs = ArrayList<Long>(beats.size)
+        for (i in beats.indices) {
+            if (beats[i].accepted) {
+                accDur.add(beats[i].normalizedMs)
+                accTs.add(endTsPerBeat[i])
+            }
+        }
+        return Triple(accDur.toIntArray(), accTs.toLongArray(), source)
+    }
+
     /** Samsung sometimes ships nanoseconds, sometimes ms, sometimes 0. */
     fun normalizeSensorTimestampMs(raw: Long): Long {
         if (raw <= 0L) return 0L
