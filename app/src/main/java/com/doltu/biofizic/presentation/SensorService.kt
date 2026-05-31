@@ -677,10 +677,9 @@ class SensorService : Service(), SensorEventListener {
                     stopSelf()
                     return START_NOT_STICKY
                 }
-                if (intent.hasExtra(EXTRA_REPORTED_AROUSAL)) {
-                    // Sent once MQTT is up (see logPeriodicStatus).
-                    pendingReportedArousal = intent.getDoubleExtra(EXTRA_REPORTED_AROUSAL, Double.NaN)
-                }
+                // Plain start NEVER recalibrates: the persisted baseline is kept
+                // and accumulates. Recalibration happens only via ACTION_RECALIBRATE
+                // (the yellow button), so a start no longer arms a pending profile.
                 if (!isRunning) {
                     Log.i(TAG, "Pornire tracking (ACTION_START)")
                     isRunning = true
@@ -690,11 +689,13 @@ class SensorService : Service(), SensorEventListener {
             }
             ACTION_RECALIBRATE -> {
                 val reported = intent.getDoubleExtra(EXTRA_REPORTED_AROUSAL, Double.NaN)
+                val reactivity = intent.getStringExtra(EXTRA_REACTIVITY)
                 if (isRunning && isMqttConnected) {
-                    requestProfileRecalibration(reported)
+                    requestProfileRecalibration(reported, reactivity)
                 } else {
                     // Defer until MQTT connects.
                     pendingReportedArousal = reported
+                    pendingReactivity = reactivity
                     Log.w(TAG, "Recalibrare amânată: MQTT inactiv")
                 }
                 return START_STICKY
@@ -1276,26 +1277,36 @@ class SensorService : Service(), SensorEventListener {
         )
     }
 
-    private fun requestProfileRecalibration(reportedArousal: Double = Double.NaN) {
+    private fun requestProfileRecalibration(
+        reportedArousal: Double = Double.NaN,
+        reactivity: String? = null,
+    ) {
         val ts = System.currentTimeMillis()
         calibrateRequestedAtMs = ts  // anything older than this is stale/retained
         val arousalJson =
             if (reportedArousal.isNaN()) "" else ""","reported_arousal":$reportedArousal"""
+        // Reactivity (low|normal|high) sets the one-time emotional-responsiveness
+        // profile that scales the valence dead-band. Server validates the value.
+        val reactivityJson =
+            if (reactivity in listOf("low", "normal", "high")) ""","reactivity":"$reactivity"""" else ""
         publish(
             "biofizic/cmd/calibrate",
-            """{"ts":$ts,"action":"profile","source":"watch"$arousalJson}""",
+            """{"ts":$ts,"action":"profile","source":"watch"$arousalJson$reactivityJson}""",
         )
         calibrationPhase = "collecting"
         calibrationMessage = "Recalibrare… stai liniștit 1–2 min"
         syncUiState()  // push "collecting" to Compose so the spinner shows now
-        Log.i(TAG, "Recalibrare trimisă (arousal=$reportedArousal)")
+        Log.i(TAG, "Recalibrare trimisă (arousal=$reportedArousal, reactivity=$reactivity)")
     }
 
-    /** Send a deferred self-report calibration once MQTT is live. */
+    /** Send a deferred self-report calibration once MQTT is live. Only armed by a
+     *  recalibrate request that hit while MQTT was down — a plain start never sets
+     *  pendingReportedArousal, so this can no longer recalibrate on start. */
     private fun flushPendingCalibration() {
         if (!pendingReportedArousal.isNaN() && isRunning && isMqttConnected) {
-            requestProfileRecalibration(pendingReportedArousal)
+            requestProfileRecalibration(pendingReportedArousal, pendingReactivity)
             pendingReportedArousal = Double.NaN
+            pendingReactivity = null
         }
     }
 

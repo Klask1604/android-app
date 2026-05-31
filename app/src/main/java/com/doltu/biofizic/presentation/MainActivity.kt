@@ -201,8 +201,6 @@ fun BiofizicWatchApp() {
     }
 
     var showQuestionnaire by remember { mutableStateOf(false) }
-    var questionnaireForStart by remember { mutableStateOf(true) }
-
     MaterialTheme {
         BoxWithConstraints(
             modifier = Modifier
@@ -215,13 +213,14 @@ fun BiofizicWatchApp() {
             if (showQuestionnaire) {
                 MoodQuestionnaire(
                     contentWidth = contentW,
-                    onDone = { arousal ->
-                        val action = if (questionnaireForStart) SensorService.ACTION_START
-                        else SensorService.ACTION_RECALIBRATE
+                    onDone = { arousal, reactivity ->
+                        // The questionnaire is shown ONLY from the recalibrate
+                        // button, so it always means a profile recalibration.
                         context.startForegroundService(
                             Intent(context, SensorService::class.java).apply {
-                                this.action = action
+                                this.action = SensorService.ACTION_RECALIBRATE
                                 putExtra(SensorService.EXTRA_REPORTED_AROUSAL, arousal)
+                                putExtra(SensorService.EXTRA_REACTIVITY, reactivity)
                             },
                         )
                         (context as? MainActivity)?.applyKeepScreenOn()
@@ -258,7 +257,6 @@ fun BiofizicWatchApp() {
                         contentWidth = contentW,
                         onLongPressRecalibrate = {
                             if (uiState.isRunning) {
-                                questionnaireForStart = false
                                 showQuestionnaire = true
                             }
                         },
@@ -276,7 +274,6 @@ fun BiofizicWatchApp() {
                                 color = AccentMotion,
                                 side = 34.dp,
                                 onClick = {
-                                    questionnaireForStart = false
                                     showQuestionnaire = true
                                 },
                             ) { RecalibrateGlyph() }
@@ -300,8 +297,16 @@ fun BiofizicWatchApp() {
                                         WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
                                     )
                                 } else {
-                                    questionnaireForStart = true
-                                    showQuestionnaire = true
+                                    // Plain start: just begin tracking with the
+                                    // persisted baseline — no questionnaire, no
+                                    // recalibration. Recalibrate only via the
+                                    // yellow button.
+                                    context.startForegroundService(
+                                        Intent(context, SensorService::class.java).apply {
+                                            action = SensorService.ACTION_START
+                                        },
+                                    )
+                                    (context as? MainActivity)?.applyKeepScreenOn()
                                 }
                             },
                         ) {
@@ -383,27 +388,47 @@ private fun RecalibrateGlyph() {
 @Composable
 private fun MoodQuestionnaire(
     contentWidth: Dp,
-    onDone: (arousal: Double) -> Unit,
+    onDone: (arousal: Double, reactivity: String) -> Unit,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    // Single arousal self-report: anchors where the personal baseline sits on the
-    // 0..1 arousal scale (Relaxat -> Stresat). The pick is sent as reported_arousal.
+    // Two-step recalibration self-report (only shown from the yellow recalibrate
+    // button, never on plain start):
+    //   1. arousal -> anchors where the personal baseline sits on the 0..1 scale.
+    //   2. reactivity -> the one-time emotional-responsiveness profile that scales
+    //      the valence dead-band (low responder -> narrower neutral zone).
     val arousalOpts = listOf("Relaxat" to 0.15, "Normal" to 0.40, "Tensionat" to 0.65, "Stresat" to 0.85)
+    val reactivityOpts = listOf("Puțin" to "low", "Normal" to "normal", "Mult" to "high")
+    var pickedArousal by remember { mutableStateOf<Double?>(null) }
+
     Column(modifier = modifier, horizontalAlignment = Alignment.CenterHorizontally) {
-        Text("Cât de stresat te simți?", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary)
-        Spacer(Modifier.height(6.dp))
-        arousalOpts.forEach { (label, value) ->
-            Button(
-                onClick = { onDone(value) },
-                colors = ButtonDefaults.buttonColors(backgroundColor = RingTrack),
-                modifier = Modifier.width(contentWidth).height(26.dp).padding(vertical = 2.dp),
-            ) {
-                Text(label, fontSize = 11.sp, color = TextPrimary)
+        if (pickedArousal == null) {
+            Text("Cât de stresat te simți?", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary)
+            Spacer(Modifier.height(6.dp))
+            arousalOpts.forEach { (label, value) ->
+                Button(
+                    onClick = { pickedArousal = value },
+                    colors = ButtonDefaults.buttonColors(backgroundColor = RingTrack),
+                    modifier = Modifier.width(contentWidth).height(26.dp).padding(vertical = 2.dp),
+                ) {
+                    Text(label, fontSize = 11.sp, color = TextPrimary)
+                }
             }
+        } else {
+            Text("Cât de reactiv emoțional ești?", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary)
+            Spacer(Modifier.height(6.dp))
+            reactivityOpts.forEach { (label, value) ->
+                Button(
+                    onClick = { onDone(pickedArousal!!, value) },
+                    colors = ButtonDefaults.buttonColors(backgroundColor = RingTrack),
+                    modifier = Modifier.width(contentWidth).height(26.dp).padding(vertical = 2.dp),
+                ) {
+                    Text(label, fontSize = 11.sp, color = TextPrimary)
+                }
+            }
+            Spacer(Modifier.height(2.dp))
+            Text("apoi stai liniștit 1–2 min", fontSize = 8.sp, color = TextMuted)
         }
-        Spacer(Modifier.height(2.dp))
-        Text("apoi stai liniștit 1–2 min", fontSize = 8.sp, color = TextMuted)
     }
 }
 

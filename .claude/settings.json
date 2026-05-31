@@ -207,7 +207,9 @@
       "Bash(sed -n '4p')",
       "Bash(./venv/Scripts/python.exe -c \"import ast; [ast.parse\\(open\\(f,encoding='utf-8'\\).read\\(\\)\\) for f in ['affectus/engine/pipeline.py','services/compute_engine.py','services/mqtt_logger.py']]; print\\('OK sintaxa'\\)\")",
       "Bash(./venv/Scripts/python.exe -m pytest tests/test_valence_baseline.py tests/test_legacy_toggles.py tests/test_valence_wesad_channel.py tests/test_compute_engine_smoothing.py -q)",
-      "Bash(./venv/Scripts/python.exe -c \"import json; json.load\\(open\\('docker/grafana/provisioning/dashboards/3-Findings/biofizic-emotion-per-model.json',encoding='utf-8'\\)\\); print\\('per-model JSON OK'\\)\")"
+      "Bash(./venv/Scripts/python.exe -c \"import json; json.load\\(open\\('docker/grafana/provisioning/dashboards/3-Findings/biofizic-emotion-per-model.json',encoding='utf-8'\\)\\); print\\('per-model JSON OK'\\)\")",
+      "Bash(awk '{print $6, $7, $8}')",
+      "Bash(./gradlew compileDebugKotlin)"
     ],
     "additionalDirectories": [
       "c:\\Users\\doltu\\.claude\\projects\\c--Users-doltu-AndroidStudioProjects-biofizic\\memory"
