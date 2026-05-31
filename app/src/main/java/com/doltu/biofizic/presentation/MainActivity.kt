@@ -201,6 +201,7 @@ fun BiofizicWatchApp() {
     }
 
     var showQuestionnaire by remember { mutableStateOf(false) }
+    var showFeedback by remember { mutableStateOf(false) }
     MaterialTheme {
         BoxWithConstraints(
             modifier = Modifier
@@ -210,7 +211,24 @@ fun BiofizicWatchApp() {
             val minSide = minOf(maxWidth, maxHeight)
             val contentW = minSide * SAFE_WIDTH_FRACTION
 
-            if (showQuestionnaire) {
+            if (showFeedback) {
+                EmotionQuestionnaire(
+                    contentWidth = contentW,
+                    onDone = { quadrant ->
+                        // Fire-and-forget label: the server pairs it with the
+                        // recent PPG features. No recalibration, no spinner.
+                        context.startForegroundService(
+                            Intent(context, SensorService::class.java).apply {
+                                this.action = SensorService.ACTION_FEEDBACK
+                                putExtra(SensorService.EXTRA_FEEDBACK_QUADRANT, quadrant)
+                            },
+                        )
+                        showFeedback = false
+                    },
+                    onCancel = { showFeedback = false },
+                    modifier = Modifier.align(Alignment.Center).width(contentW),
+                )
+            } else if (showQuestionnaire) {
                 MoodQuestionnaire(
                     contentWidth = contentW,
                     onDone = { arousal, reactivity ->
@@ -277,6 +295,14 @@ fun BiofizicWatchApp() {
                                     showQuestionnaire = true
                                 },
                             ) { RecalibrateGlyph() }
+                            // Emotion feedback: the user labels how they feel now.
+                            SquareButton(
+                                color = Color(0xFF8E44AD),
+                                side = 34.dp,
+                                onClick = {
+                                    showFeedback = true
+                                },
+                            ) { FeedbackGlyph() }
                         }
                         val btnColor by animateColorAsState(
                             if (uiState.isRunning) BtnStop else BtnStart,
@@ -364,6 +390,33 @@ private fun StopGlyph() {
 }
 
 @Composable
+private fun FeedbackGlyph() {
+    // A simple smiley: outline circle + two eyes + a smile arc — the "label how
+    // you feel" affordance.
+    Canvas(modifier = Modifier.size(16.dp)) {
+        val stroke = 1.6.dp.toPx()
+        drawCircle(
+            color = Color.White,
+            radius = size.minDimension * 0.42f,
+            center = Offset(size.width / 2f, size.height / 2f),
+            style = Stroke(width = stroke),
+        )
+        val eyeR = size.minDimension * 0.06f
+        drawCircle(Color.White, eyeR, Offset(size.width * 0.38f, size.height * 0.42f))
+        drawCircle(Color.White, eyeR, Offset(size.width * 0.62f, size.height * 0.42f))
+        drawArc(
+            color = Color.White,
+            startAngle = 20f,
+            sweepAngle = 140f,
+            useCenter = false,
+            topLeft = Offset(size.width * 0.30f, size.height * 0.38f),
+            size = Size(size.width * 0.40f, size.height * 0.32f),
+            style = Stroke(width = stroke, cap = StrokeCap.Round),
+        )
+    }
+}
+
+@Composable
 private fun RecalibrateGlyph() {
     Canvas(modifier = Modifier.size(14.dp)) {
         val stroke = 2.dp.toPx()
@@ -382,6 +435,37 @@ private fun RecalibrateGlyph() {
             close()
         }
         drawPath(a, Color.White)
+    }
+}
+
+@Composable
+private fun EmotionQuestionnaire(
+    contentWidth: Dp,
+    onDone: (quadrant: String) -> Unit,
+    onCancel: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    // The user labels how they feel RIGHT NOW with a full Russell quadrant. This
+    // is the ground-truth the models are validated against (and later, maybe,
+    // trained on). One tap = one labelled training pair.
+    val quadrants = listOf(
+        "Bucuros" to Color(0xFFB8860B),
+        "Calm" to Color(0xFF2E7D32),
+        "Trist" to Color(0xFF1565C0),
+        "Stresat" to Color(0xFFC62828),
+    )
+    Column(modifier = modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+        Text("Cum te simți acum?", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary)
+        Spacer(Modifier.height(6.dp))
+        quadrants.forEach { (label, color) ->
+            Button(
+                onClick = { onDone(label) },
+                colors = ButtonDefaults.buttonColors(backgroundColor = color),
+                modifier = Modifier.width(contentWidth).height(26.dp).padding(vertical = 2.dp),
+            ) {
+                Text(label, fontSize = 11.sp, color = Color.White)
+            }
+        }
     }
 }
 

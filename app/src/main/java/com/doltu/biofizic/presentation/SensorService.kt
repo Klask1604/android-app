@@ -108,6 +108,10 @@ class SensorService : Service(), SensorEventListener {
         const val ACTION_START = "com.doltu.biofizic.ACTION_START"
         const val ACTION_STOP = "com.doltu.biofizic.ACTION_STOP"
         const val ACTION_RECALIBRATE = "com.doltu.biofizic.ACTION_RECALIBRATE"
+        // User emotion feedback: a Russell quadrant the user tapped to label how
+        // they feel right now. Pairs server-side with the recent PPG features.
+        const val ACTION_FEEDBACK = "com.doltu.biofizic.ACTION_FEEDBACK"
+        const val EXTRA_FEEDBACK_QUADRANT = "com.doltu.biofizic.EXTRA_FEEDBACK_QUADRANT"
         // Self-reported arousal in [0,1] from the watch questionnaire; anchors
         // where the new baseline sits on the arousal scale.
         const val EXTRA_REPORTED_AROUSAL = "com.doltu.biofizic.EXTRA_REPORTED_AROUSAL"
@@ -698,6 +702,11 @@ class SensorService : Service(), SensorEventListener {
                     pendingReactivity = reactivity
                     Log.w(TAG, "Recalibrare amânată: MQTT inactiv")
                 }
+                return START_STICKY
+            }
+            ACTION_FEEDBACK -> {
+                val quadrant = intent.getStringExtra(EXTRA_FEEDBACK_QUADRANT)
+                if (quadrant != null) sendEmotionFeedback(quadrant)
                 return START_STICKY
             }
             else -> {
@@ -1297,6 +1306,22 @@ class SensorService : Service(), SensorEventListener {
         calibrationMessage = "Recalibrare… stai liniștit 1–2 min"
         syncUiState()  // push "collecting" to Compose so the spinner shows now
         Log.i(TAG, "Recalibrare trimisă (arousal=$reportedArousal, reactivity=$reactivity)")
+    }
+
+    /** Publish a user emotion-feedback label (a Russell quadrant). The server
+     *  pairs it with the recent PPG features for the watch-native labelled set.
+     *  Fire-and-forget: a missed label is harmless, no spinner / state change. */
+    private fun sendEmotionFeedback(quadrant: String) {
+        if (!isMqttConnected) {
+            Log.w(TAG, "Feedback ignorat: MQTT inactiv ($quadrant)")
+            return
+        }
+        val ts = System.currentTimeMillis()
+        publish(
+            "biofizic/cmd/feedback",
+            """{"ts":$ts,"action":"emotion","quadrant":"$quadrant","source":"watch"}""",
+        )
+        Log.i(TAG, "Feedback trimis: $quadrant")
     }
 
     /** Send a deferred self-report calibration once MQTT is live. Only armed by a
