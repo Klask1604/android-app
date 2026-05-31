@@ -24,4 +24,18 @@ data class UiState(
     // UI uses this to show a small badge so a preliminary verdict isn't
     // confused with a fully calibrated one.
     val decisionFidelity: String = "calibrated",
+    // 2D emotion verdict (Russell circumplex) from the server: a single word
+    // (Calm/Trist/Bucuros/Stresat/Neutru) plus the personal valence axis. Valence
+    // is shown only once valenceReady (its baseline has locked); until then the
+    // verdict falls back to Neutru and the watch shows arousal alone.
+    val emotionVerdict: String = "—",
+    val valence: Float = 0f,
+    val valenceReady: Boolean = false,
+    // ECG calibration (finger-hold): when active the watch shows a dedicated
+    // screen with a live contact indicator and a progress bar. ecgContact = the
+    // finger is currently on the button (lead on); ecgProgress = 0..1 toward the
+    // ~30 s of good contact the baseline needs.
+    val ecgCalibrationActive: Boolean = false,
+    val ecgContact: Boolean = false,
+    val ecgProgress: Float = 0f,
 )

@@ -215,7 +215,7 @@ fun BiofizicWatchApp() {
             if (showQuestionnaire) {
                 MoodQuestionnaire(
                     contentWidth = contentW,
-                    onPick = { arousal ->
+                    onDone = { arousal ->
                         val action = if (questionnaireForStart) SensorService.ACTION_START
                         else SensorService.ACTION_RECALIBRATE
                         context.startForegroundService(
@@ -383,47 +383,27 @@ private fun RecalibrateGlyph() {
 @Composable
 private fun MoodQuestionnaire(
     contentWidth: Dp,
-    onPick: (Double) -> Unit,
+    onDone: (arousal: Double) -> Unit,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    // Single activation axis (parasympathetic -> sympathetic). The pick anchors
-    // where the personal baseline sits on the 0..1 arousal scale.
-    val options = listOf(
-        "Calm" to 0.2,
-        "Normal" to 0.4,
-        "Alert" to 0.6,
-        "Stresat" to 0.8,
-    )
-    Column(
-        modifier = modifier,
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Text(
-            text = "Cum te simți?",
-            fontSize = 13.sp,
-            fontWeight = FontWeight.SemiBold,
-            color = TextPrimary,
-        )
+    // Single arousal self-report: anchors where the personal baseline sits on the
+    // 0..1 arousal scale (Relaxat -> Stresat). The pick is sent as reported_arousal.
+    val arousalOpts = listOf("Relaxat" to 0.15, "Normal" to 0.40, "Tensionat" to 0.65, "Stresat" to 0.85)
+    Column(modifier = modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+        Text("Cât de stresat te simți?", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary)
         Spacer(Modifier.height(6.dp))
-        options.forEach { (label, arousal) ->
+        arousalOpts.forEach { (label, value) ->
             Button(
-                onClick = { onPick(arousal) },
+                onClick = { onDone(value) },
                 colors = ButtonDefaults.buttonColors(backgroundColor = RingTrack),
-                modifier = Modifier
-                    .width(contentWidth)
-                    .height(26.dp)
-                    .padding(vertical = 2.dp),
+                modifier = Modifier.width(contentWidth).height(26.dp).padding(vertical = 2.dp),
             ) {
                 Text(label, fontSize = 11.sp, color = TextPrimary)
             }
         }
         Spacer(Modifier.height(2.dp))
-        Text(
-            text = "apoi stai liniștit 1–2 min",
-            fontSize = 8.sp,
-            color = TextMuted,
-        )
+        Text("apoi stai liniștit 1–2 min", fontSize = 8.sp, color = TextMuted)
     }
 }
 
@@ -452,6 +432,7 @@ private fun WatchFaceContent(
     val hasVerdict = isRunning && arousalFused >= 0f
     val accent = arousalAccent(hasVerdict, arousal10, motionGated, isRunning, mqttOk)
 
+    // Arousal-only classifier: big number /10 + the arousal label.
     val statusText = when {
         calibrating && calMessage.isNotBlank() -> calMessage
         hasVerdict -> arousalLabel

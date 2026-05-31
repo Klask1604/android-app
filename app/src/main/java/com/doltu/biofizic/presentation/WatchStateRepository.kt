@@ -68,6 +68,15 @@ object WatchStateRepository {
     @Volatile var calibrationMessage: String = ""
     // "preliminary" | "calibrated" — see UiState.decisionFidelity.
     @Volatile var decisionFidelity: String = "calibrated"
+    // 2D emotion verdict from the server (see UiState.emotionVerdict).
+    @Volatile var emotionVerdict: String = "-"
+    @Volatile var valence: Float = 0f
+    @Volatile var valenceReady: Boolean = false
+
+    // ----- ECG calibration finger-hold (see UiState) -----
+    @Volatile var ecgCalibrationActive: Boolean = false
+    @Volatile var ecgContact: Boolean = false
+    @Volatile var ecgProgress: Float = 0f
 
     // ----- Compose-visible snapshot -----
     private val _uiState = MutableStateFlow(UiState())
@@ -91,6 +100,12 @@ object WatchStateRepository {
             calibrationPhase = calibrationPhase,
             calibrationMessage = calibrationMessage,
             decisionFidelity = decisionFidelity,
+            emotionVerdict = emotionVerdict,
+            valence = valence,
+            valenceReady = valenceReady,
+            ecgCalibrationActive = ecgCalibrationActive,
+            ecgContact = ecgContact,
+            ecgProgress = ecgProgress,
         )
     }
 }

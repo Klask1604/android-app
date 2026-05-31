@@ -62,9 +62,25 @@ class SensorService : Service(), SensorEventListener {
             onEpochState = { parseEpochStateMessage(it) },
             onStateLive = { parseStateLiveMessage(it) },
             onCalibrationStatus = { parseCalibrationStatus(it) },
+            onHelloAck = { parseHelloAck(it) },
             onMessagePublished = { msgCount++ },
         )
     }
+
+    // Capability handshake state. The server validates the sensors we announce
+    // and replies on biofizic/hello/ack; we only start streaming once it says
+    // "ok". `handshakeOk` gates the publish loops so a device the server cannot
+    // classify (e.g. skin-temp only) never floods the broker with unusable data.
+    // Handshake state. handshakeOk: server replied "ok". handshakeAckReceived:
+    // server replied at all (ok OR error). handshakeSentAtMs: when we last
+    // announced — used for the fail-open timeout (stream anyway if no ack) and
+    // the slow retry (re-announce until the server answers).
+    @Volatile private var handshakeOk: Boolean = false
+    @Volatile private var handshakeAckReceived: Boolean = false
+    @Volatile private var handshakeRejected: Boolean = false
+    @Volatile private var handshakeReason: String = ""
+    @Volatile private var handshakeSentAtMs: Long = 0L
+    @Volatile private var streamingStarted: Boolean = false
 
     // ── Samsung Health SDK ──
     private var healthTrackingService: HealthTrackingService? = null
@@ -95,23 +111,47 @@ class SensorService : Service(), SensorEventListener {
         // Self-reported arousal in [0,1] from the watch questionnaire; anchors
         // where the new baseline sits on the arousal scale.
         const val EXTRA_REPORTED_AROUSAL = "com.doltu.biofizic.EXTRA_REPORTED_AROUSAL"
+        const val EXTRA_REPORTED_VALENCE = "com.doltu.biofizic.EXTRA_REPORTED_VALENCE"
+        const val EXTRA_REACTIVITY = "com.doltu.biofizic.EXTRA_REACTIVITY"
 
         // Raw full-rate firehose for testing: every sensor DataPoint, every value
         // key the SDK exposes, published as-is on a separate topic — independent of
         // all production toggles/aggregation. Default OFF in production. Flip ON
-        // for a research session (cardiac-comparator, NK shadow, etc) and rebuild.
+        // for the cardiac-comparator experiment (publishes HR/PPG/acc continuous
+        // dumps on biofizic/test/*). NOT needed for the 100 Hz valence PPG —
+        // that has its own flag below.
         const val PUBLISH_TEST_DUMP = false
         const val TEST_TOPIC = "biofizic/test"
 
-        // Confirmed empirically on Galaxy Watch 7: starting PPG_ON_DEMAND in
-        // parallel with HEART_RATE_CONTINUOUS stops the HR tracker from
-        // delivering IBI bursts. That starves the server's HRV pipeline (empty
-        // ibi_buffer → no baseline lock → watch UI stuck on "Profil…"). Keep
-        // OFF except when actively running the cardiac-comparator experiment.
-        const val START_PPG_ON_DEMAND = false
+        // 100 Hz on-demand PPG for the valence frequency-domain features,
+        // published on its own clean topic (biofizic/ppg/ondemand), independent
+        // of the noisy test dumps above. Empirically on GW7 this runs in
+        // parallel with HR/IBI without starving the HRV pipeline (verified
+        // 2026-05: arousal + valence both live).
+        const val PUBLISH_PPG_ONDEMAND = true
+        const val PPG_ONDEMAND_TOPIC = "biofizic/ppg/ondemand"
+
+        // Start the PPG_ON_DEMAND tracker (100 Hz). Gated together with
+        // PUBLISH_PPG_ONDEMAND.
+        const val START_PPG_ON_DEMAND = true
+
+        // ECG-based calibration: during calibration the user holds a finger on the
+        // button (Lead-I), the watch streams raw 500 Hz ECG to the server which
+        // detects R-peaks -> clean HRV baseline. Decoupled from PUBLISH_TEST_DUMP.
+        const val ECG_CALIBRATE_TOPIC = "biofizic/ecg/calibrate"
+        // A single FIXED window drives the whole ECG step: the progress bar is
+        // elapsed/ECG_WINDOW_MS and at time-up the screen dismisses, finger or not.
+        const val ECG_WINDOW_MS = 45_000L
+        @Volatile var ecgCalibrationActive: Boolean = false
+        @Volatile var ecgCalibrationStartMs: Long = 0L
+        // Last moment the finger was on the button — drives ONLY the live contact
+        // indicator (green/orange), never the progress or the stop condition.
+        @Volatile var lastLeadOnMs: Long = 0L
 
         // Pending self-report to send as a calibration once MQTT is connected.
         @Volatile var pendingReportedArousal: Double = Double.NaN
+        @Volatile var pendingReportedValence: Double = Double.NaN
+        @Volatile var pendingReactivity: String? = null
 
         // When we last asked for a (re)calibration. Used to ignore the RETAINED
         // "done" status that the broker replays on every (re)subscribe: any
@@ -120,6 +160,12 @@ class SensorService : Service(), SensorEventListener {
         @Volatile var calibrateRequestedAtMs: Long = 0L
         // Skew margin (watch vs server clock) so a FRESH status is never dropped.
         const val CALIBRATION_STALE_MARGIN_MS = 10_000L
+
+        // Handshake fail-open: start streaming if no ack arrives within this long
+        // (server briefly down / message lost). Re-announce every retry interval
+        // until the server answers. Only an explicit "error" ack stops streaming.
+        const val HANDSHAKE_FAIL_OPEN_MS = 10_000L
+        const val HANDSHAKE_RETRY_MS = 60_000L
 
         private val state = WatchStateRepository
 
@@ -231,6 +277,24 @@ class SensorService : Service(), SensorEventListener {
         var decisionFidelity: String
             get() = state.decisionFidelity
             set(value) { state.decisionFidelity = value }
+        var emotionVerdict: String
+            get() = state.emotionVerdict
+            set(value) { state.emotionVerdict = value }
+        var valence: Float
+            get() = state.valence
+            set(value) { state.valence = value }
+        var valenceReady: Boolean
+            get() = state.valenceReady
+            set(value) { state.valenceReady = value }
+        var ecgUiActive: Boolean
+            get() = state.ecgCalibrationActive
+            set(value) { state.ecgCalibrationActive = value }
+        var ecgContact: Boolean
+            get() = state.ecgContact
+            set(value) { state.ecgContact = value }
+        var ecgProgress: Float
+            get() = state.ecgProgress
+            set(value) { state.ecgProgress = value }
 
         // Compose snapshot
         val uiState: StateFlow<UiState> get() = state.uiState
@@ -482,11 +546,13 @@ class SensorService : Service(), SensorEventListener {
         }
     }
 
-    /** ECG raw @ 500 Hz — TEST ONLY, on-demand (user must hold a finger on the
-     *  button; data flows only while LEAD_OFF == 0). Dumped to biofizic/test/ecg. */
+    /** ECG raw @ 500 Hz, on-demand (user holds a finger on the button; data flows
+     *  only while LEAD_OFF == 0). During a calibration it is buffered + streamed to
+     *  the server for R-peak -> clean HRV baseline; the test dump path is kept. */
     private val ecgListener = object : HealthTracker.TrackerEventListener {
         override fun onDataReceived(dataPoints: List<DataPoint>) {
-            dumpEcgTest(dataPoints)
+            if (ecgCalibrationActive) bufferEcgCalibration(dataPoints)
+            if (PUBLISH_TEST_DUMP) dumpEcgTest(dataPoints)
         }
         override fun onFlushCompleted() {}
         override fun onError(e: HealthTracker.TrackerError) {
@@ -497,7 +563,10 @@ class SensorService : Service(), SensorEventListener {
     /** PPG on-demand @100 Hz — TEST ONLY → biofizic/test/ppg_ondemand. */
     private val ppgOnDemandListener = object : HealthTracker.TrackerEventListener {
         override fun onDataReceived(dataPoints: List<DataPoint>) {
-            dumpPpgOnDemandTest(dataPoints)
+            // Buffer at 100 Hz; the publish loop flushes ONE aggregated message
+            // per tick (~1 s) so the radio wakes once/s instead of ~70x/s. The
+            // sensor still samples at 100 Hz, so valence is unaffected.
+            bufferPpgOnDemand(dataPoints)
         }
         override fun onFlushCompleted() {}
         override fun onError(e: HealthTracker.TrackerError) {
@@ -682,6 +751,27 @@ class SensorService : Service(), SensorEventListener {
         emptyList()
     }
 
+    /**
+     * The capability names this watch announces to the server, in the server's
+     * contract vocabulary (affectus.contract.Capability). Derived from the
+     * trackers that actually started, not from a hardcoded device model: IBI +
+     * HR come from the heart-rate tracker, MOTION from the accelerometer,
+     * SKIN_TEMP from the skin-temperature tracker, PPG only when raw PPG is
+     * published. The server replies on biofizic/hello/ack whether this set is
+     * enough to classify arousal.
+     */
+    private fun capabilityNames(): List<String> {
+        val caps = mutableListOf<String>()
+        if (heartRateTracker != null) { caps.add("ibi"); caps.add("hr") }
+        if (accSdkTracker != null || hasAndroidAccelerometer()) caps.add("motion")
+        if (skinTempTracker != null) caps.add("temp")
+        if (AcquisitionAssembler.PUBLISH_RAW_PPG && ppgTracker != null) caps.add("ppg")
+        return caps
+    }
+
+    private fun hasAndroidAccelerometer(): Boolean =
+        sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) != null
+
     private fun buildAndroidSensorInventory() {
         val lines = StringBuilder()
         lines.appendLine("Android (SensorManager):")
@@ -833,13 +923,13 @@ class SensorService : Service(), SensorEventListener {
         // because on Galaxy Watch 7 this tracker silently blocks
         // HEART_RATE_CONTINUOUS from emitting IBI bursts, starving the server
         // HRV pipeline. Enable only for the cardiac-comparator experiment.
-        if (PUBLISH_TEST_DUMP && START_PPG_ON_DEMAND
+        if (PUBLISH_PPG_ONDEMAND && START_PPG_ON_DEMAND
             && HealthTrackerType.PPG_ON_DEMAND in capabilities) {
             ppgOnDemandTracker = obtainPpgTracker(HealthTrackerType.PPG_ON_DEMAND)
             if (ppgOnDemandTracker != null) {
                 handler.post { ppgOnDemandTracker?.setEventListener(ppgOnDemandListener) }
                 count++
-                Log.i(TAG, "✓ PPG on-demand pornit (100 Hz, test)")
+                Log.i(TAG, "✓ PPG on-demand pornit (100 Hz → $PPG_ONDEMAND_TOPIC)")
             }
         }
 
@@ -869,7 +959,11 @@ class SensorService : Service(), SensorEventListener {
             TAG,
             "MQTT: acquisition/batch at ${mqttPublishIntervalMs}ms"
         )
-        startPublishLoops()
+        // Do NOT start streaming yet. Announce our sensors and wait for the
+        // server's ok on biofizic/hello/ack — parseHelloAck() starts the publish
+        // loops once accepted. This makes the contract server-enforced: a device
+        // the server can't classify never streams.
+        publishHello()
     }
 
     private fun restartHrTracker() {
@@ -986,6 +1080,81 @@ class SensorService : Service(), SensorEventListener {
             syncUiState()
         } else {
             isMqttConnected = false
+        }
+    }
+
+    /**
+     * Announce our sensors to the server (biofizic/hello) so it can validate the
+     * set and reply with the modules it will run. Called after the SDK trackers
+     * start (so capabilityNames() reflects what actually came up) and whenever
+     * MQTT (re)connects. Streaming stays gated on the ok reply.
+     */
+    private fun publishHello() {
+        val caps = capabilityNames()
+        val capsJson = caps.joinToString(",") { "\"$it\"" }
+        val payload = "{\"client_id\":\"$CLIENT_ID\",\"schema\":2," +
+            "\"capabilities\":[$capsJson],\"profile\":\"wrist_ppg\"}"
+        mqttSession.publish("biofizic/hello", payload)
+        handshakeSentAtMs = System.currentTimeMillis()
+        Log.i(TAG, "handshake: announced $caps")
+    }
+
+    /** Fail-open: start streaming if the server hasn't answered within the
+     *  timeout. Better to send data (the server processes batches even without a
+     *  handshake) than to stay mute when the server is briefly down. Called from
+     *  the watchdog and after publishHello. A later "error" ack can still stop it. */
+    private fun maybeStartStreamingAfterHandshakeTimeout() {
+        if (streamingStarted || handshakeRejected) return
+        val waited = System.currentTimeMillis() - handshakeSentAtMs
+        if (handshakeSentAtMs > 0 && waited >= HANDSHAKE_FAIL_OPEN_MS) {
+            Log.w(TAG, "handshake: no ack in ${waited}ms — streaming anyway (fail-open)")
+            startStreaming()
+        }
+    }
+
+    /** Slow retry: if we announced but never got ANY ack, re-announce so the
+     *  verdict eventually arrives once the server is back. Stops once any ack
+     *  (ok or error) is received. */
+    private fun maybeRetryHandshake() {
+        if (handshakeAckReceived || !isMqttConnected || heartRateTracker == null) return
+        if (handshakeSentAtMs > 0 &&
+            System.currentTimeMillis() - handshakeSentAtMs >= HANDSHAKE_RETRY_MS) {
+            Log.i(TAG, "handshake: no ack yet — re-announcing")
+            publishHello()
+        }
+    }
+
+    private fun startStreaming() {
+        if (streamingStarted) return
+        streamingStarted = true
+        startPublishLoops()
+    }
+
+    private fun parseHelloAck(json: String) {
+        try {
+            val obj = JSONObject(json)
+            val status = obj.optString("status")
+            handshakeReason = obj.optString("reason", "")
+            handshakeAckReceived = true  // got a reply -> stop the retry loop
+            if (status == "ok") {
+                handshakeOk = true
+                handshakeRejected = false
+                val mods = obj.optJSONArray("modules_active")
+                Log.i(TAG, "handshake OK: server will run $mods")
+                startStreaming()  // idempotent: no-op if fail-open already started it
+            } else {
+                // Explicit rejection (e.g. too few sensors to classify): stop
+                // streaming and surface the reason. This is the ONLY case that
+                // halts data — a silent/absent server never does (fail-open).
+                handshakeOk = false
+                handshakeRejected = true
+                Log.w(TAG, "handshake REJECTED: $handshakeReason")
+                stopPublishLoops()
+                streamingStarted = false
+            }
+            syncUiState()
+        } catch (e: Exception) {
+            Log.w(TAG, "hello/ack parse: ${e.message}")
         }
     }
 
@@ -1110,16 +1279,16 @@ class SensorService : Service(), SensorEventListener {
     private fun requestProfileRecalibration(reportedArousal: Double = Double.NaN) {
         val ts = System.currentTimeMillis()
         calibrateRequestedAtMs = ts  // anything older than this is stale/retained
-        val reportedJson =
+        val arousalJson =
             if (reportedArousal.isNaN()) "" else ""","reported_arousal":$reportedArousal"""
         publish(
             "biofizic/cmd/calibrate",
-            """{"ts":$ts,"action":"profile","source":"watch"$reportedJson}""",
+            """{"ts":$ts,"action":"profile","source":"watch"$arousalJson}""",
         )
         calibrationPhase = "collecting"
         calibrationMessage = "Recalibrare… stai liniștit 1–2 min"
         syncUiState()  // push "collecting" to Compose so the spinner shows now
-        Log.i(TAG, "Recalibrare profil trimisă (reported=$reportedArousal)")
+        Log.i(TAG, "Recalibrare trimisă (arousal=$reportedArousal)")
     }
 
     /** Send a deferred self-report calibration once MQTT is live. */
@@ -1180,6 +1349,7 @@ class SensorService : Service(), SensorEventListener {
         if (motionState.isNotEmpty()) {
             motionGated = motionState != "still"
         }
+        // Arousal-only classifier: valence/verdict are not consumed on the watch.
         syncUiState()
     }
 
@@ -1246,6 +1416,11 @@ class SensorService : Service(), SensorEventListener {
             ppgSnapshot = ppgSnapshot,
         )
         publish("biofizic/acquisition/batch", payload.json)
+        // Flush the 100 Hz on-demand PPG accumulated this tick as ONE message,
+        // on the same ~1 s cadence — the radio wakes once here instead of ~70x/s.
+        flushPpgOnDemand()
+        // During a calibration finger-hold, flush the buffered 500 Hz ECG too.
+        flushEcgCalibration()
         if (payload.ibiCount > 0) {
             Log.i(
                 TAG,
@@ -1332,18 +1507,127 @@ class SensorService : Service(), SensorEventListener {
         publishTestDump("ecg", sb.toString())
     }
 
-    private fun dumpPpgOnDemandTest(dataPoints: List<DataPoint>) {
-        if (!PUBLISH_TEST_DUMP) return
-        val sb = StringBuilder("[")
-        for ((i, dp) in dataPoints.withIndex()) {
-            if (i > 0) sb.append(',')
+    /** Buffer 100 Hz on-demand PPG samples (no publish here — flushed per tick). */
+    private fun bufferPpgOnDemand(dataPoints: List<DataPoint>) {
+        if (!PUBLISH_PPG_ONDEMAND) return
+        for (dp in dataPoints) {
             val g = dp.getValue(ValueKey.PpgSet.PPG_GREEN)
             val ir = dp.getValue(ValueKey.PpgSet.PPG_IR)
-            val red = try { dp.getValue(ValueKey.PpgSet.PPG_RED).toString() } catch (e: Exception) { "null" }
-            sb.append("""{"ts":${dp.timestamp},"green":$g,"ir":$ir,"red":$red}""")
+            assembler.addPpgOnDemandSample(dp.timestamp, g, ir)
+        }
+    }
+
+    /** Flush all buffered on-demand PPG as ONE aggregated message. Called once
+     *  per publish tick (~1 s) by the scheduler, collapsing ~70 radio wake-ups/s
+     *  into one. Same {recv_ms, samples:[...]} envelope the server already parses. */
+    private fun flushPpgOnDemand() {
+        if (!PUBLISH_PPG_ONDEMAND || !isMqttConnected) return
+        val samples = assembler.drainPpgOnDemandForPublish()
+        if (samples.isEmpty()) return
+        val sb = StringBuilder("[")
+        for ((i, s) in samples.withIndex()) {
+            if (i > 0) sb.append(',')
+            sb.append("""{"ts":${s.first},"green":${s.second},"ir":${s.third}}""")
         }
         sb.append(']')
-        publishTestDump("ppg_ondemand", sb.toString())
+        publish(
+            PPG_ONDEMAND_TOPIC,
+            """{"recv_ms":${System.currentTimeMillis()},"samples":$sb}""",
+        )
+    }
+
+    // ── ECG-based calibration ────────────────────────────────────────────────
+
+    /** Buffer 500 Hz ECG samples during calibration (flushed per tick). Tracks
+     *  the last moment the lead was ON so a persistent finger-off stops the hold. */
+    private fun bufferEcgCalibration(dataPoints: List<DataPoint>) {
+        val now = System.currentTimeMillis()
+        var anyOn = false
+        for (dp in dataPoints) {
+            // ECG_MV is a Float in µV-ish units; scale ×1000 and round so the
+            // integer waveform keeps full R-peak shape for server-side detection.
+            val mv = Math.round(dp.getValue(ValueKey.EcgSet.ECG_MV) * 1000f)
+            val lead = dp.getValue(ValueKey.EcgSet.LEAD_OFF)
+            val seq = dp.getValue(ValueKey.EcgSet.SEQUENCE)
+            if (lead == 0) { lastLeadOnMs = now; anyOn = true }
+            assembler.addEcgCalibrationSample(dp.timestamp, mv, lead, seq)
+        }
+        // Live contact indicator only — progress is driven by the fixed timer in
+        // flushEcgCalibration, fully decoupled from contact so the bar never sticks.
+        ecgContact = anyOn
+        syncUiState()
+    }
+
+    /** Start streaming ECG for the calibration finger-hold. Gated on ECG_ON_DEMAND
+     *  availability; if absent, logs and returns so the existing PPG resting
+     *  collection completes calibration (graceful fallback). */
+    private fun startEcgCalibration() {
+        if (ecgCalibrationActive) return
+        if (HealthTrackerType.ECG_ON_DEMAND !in samsungCapabilities()) {
+            Log.w(TAG, "ECG calibrare indisponibilă — fallback pe PPG")
+            return
+        }
+        val now = System.currentTimeMillis()
+        ecgCalibrationActive = true
+        ecgCalibrationStartMs = now
+        lastLeadOnMs = now
+        assembler.drainEcgCalibrationForPublish()  // start clean
+        if (ecgTracker == null) ecgTracker = obtainTracker(HealthTrackerType.ECG_ON_DEMAND)
+        ecgTracker?.let { tr -> handler.post { tr.setEventListener(ecgListener) } }
+        // Drive the dedicated ECG screen (the Activity keeps the screen on and
+        // shows the progress bar while ecgCalibrationActive is true).
+        ecgUiActive = true
+        ecgContact = false
+        ecgProgress = 0f
+        syncUiState()
+        Log.i(TAG, "ECG calibrare pornită (fereastră ${ECG_WINDOW_MS}ms)")
+    }
+
+    /** Stop the ECG calibration hold: unset the tracker, clear flags + buffer. */
+    private fun stopEcgCalibration() {
+        if (!ecgCalibrationActive && ecgTracker == null) return
+        ecgCalibrationActive = false
+        ecgCalibrationStartMs = 0L
+        handler.post { ecgTracker?.unsetEventListener() }
+        ecgTracker = null
+        assembler.drainEcgCalibrationForPublish()
+        ecgUiActive = false
+        ecgContact = false
+        syncUiState()
+        Log.i(TAG, "ECG calibrare oprită")
+    }
+
+    /** The single deterministic ECG driver, called once per ~1 s publish tick.
+     *  The progress bar is elapsed/ECG_WINDOW_MS and ALWAYS advances; at time-up
+     *  we send the final chunk and dismiss the screen immediately, finger or not
+     *  (the recording for the baseline is done). One stop condition, no race. */
+    private fun flushEcgCalibration() {
+        if (!ecgCalibrationActive) return
+        val now = System.currentTimeMillis()
+        val elapsed = now - ecgCalibrationStartMs
+        val timeUp = elapsed >= ECG_WINDOW_MS
+        ecgProgress = (elapsed.toFloat() / ECG_WINDOW_MS).coerceIn(0f, 1f)
+        if (isMqttConnected) {
+            val samples = assembler.drainEcgCalibrationForPublish()
+            if (samples.isNotEmpty()) {
+                val sb = StringBuilder("[")
+                for ((i, s) in samples.withIndex()) {
+                    if (i > 0) sb.append(',')
+                    sb.append("""{"ts":${s.ts},"ecg_mv":${s.mv},"lead_off":${s.leadOff},"seq":${s.seq}}""")
+                }
+                sb.append(']')
+                val final = if (timeUp) "true" else "false"
+                publish(
+                    ECG_CALIBRATE_TOPIC,
+                    """{"recv_ms":$now,"samples":$sb,"final":$final}""",
+                )
+            }
+        }
+        syncUiState()
+        if (timeUp) {
+            Log.i(TAG, "ECG calibrare gata (fereastra de ${ECG_WINDOW_MS}ms expirat)")
+            stopEcgCalibration()
+        }
     }
 
     private fun dumpSkinTempOnDemandTest(dataPoints: List<DataPoint>) {
@@ -1396,7 +1680,18 @@ class SensorService : Service(), SensorEventListener {
                     Log.w(TAG, "MQTT disconnected, reconnecting")
                     connectMqtt()
                     Thread.sleep(5_000)
+                    // A network reconnect does NOT change the watch's sensors, so
+                    // we do NOT re-handshake here. The contract (which sensors we
+                    // carry) is unchanged; streaming simply resumes.
                 }
+
+                // Fail-open handshake retry: if we announced but never got an ack
+                // (server was down / message lost), keep re-announcing on a slow
+                // cadence until the server replies. Streaming is NOT blocked in the
+                // meantime (see maybeStartStreamingAfterHandshakeTimeout); this only
+                // makes the verdict eventually arrive once the server is back.
+                maybeStartStreamingAfterHandshakeTimeout()
+                maybeRetryHandshake()
 
                 // Verifica Samsung SDK
                 if (healthTrackingService == null) {
@@ -1449,6 +1744,13 @@ class SensorService : Service(), SensorEventListener {
         signalOk = false
         lastWindowSec = 0.0
         stopPublishLoops()
+        // Reset handshake so the next start re-announces (a stop may mean the app
+        // is being reconfigured; re-validate the contract on the next run).
+        handshakeOk = false
+        handshakeAckReceived = false
+        handshakeRejected = false
+        streamingStarted = false
+        handshakeSentAtMs = 0L
         updateSignalStatus()
         unregisterScreenReceiver()
         assembler.clear()
@@ -1469,6 +1771,7 @@ class SensorService : Service(), SensorEventListener {
         skinTempTracker?.unsetEventListener()
         accSdkTracker?.unsetEventListener()
         ecgTracker?.unsetEventListener()
+        ecgCalibrationActive = false
         ppgOnDemandTracker?.unsetEventListener()
         skinTempOnDemandTracker?.unsetEventListener()
         healthTrackingService?.disconnectService()

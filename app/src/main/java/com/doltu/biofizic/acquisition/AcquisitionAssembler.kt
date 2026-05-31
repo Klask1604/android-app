@@ -75,6 +75,22 @@ class AcquisitionAssembler(
     private val ppgBatchLock = Any()
     private val ppgBatch = mutableListOf<Triple<Long, Int, Int>>()  // (ts_ms, green, ir)
 
+    // 100 Hz on-demand PPG buffer (valence). The Samsung tracker fires
+    // onDataReceived every ~14 ms; publishing each callback would wake the radio
+    // ~70x/s and drain the battery. We buffer here and flush ONE aggregated
+    // message per publish tick (~1 s) — the sensor still runs at 100 Hz so
+    // valence quality/latency is unchanged, only the radio wake-ups collapse.
+    private val ppgOnDemandLock = Any()
+    private val ppgOnDemand = mutableListOf<Triple<Long, Int, Int>>()  // (ts_ms, green, ir)
+
+    // ECG calibration buffer (raw 500 Hz Lead-I, finger on the button). Like the
+    // PPG on-demand buffer: the tracker fires fast bursts; we buffer and flush ONE
+    // aggregated message per publish tick to the server, which detects R-peaks ->
+    // IBI -> a clean arousal baseline. Only filled while a calibration is active.
+    data class EcgSample(val ts: Long, val mv: Int, val leadOff: Int, val seq: Int)
+    private val ecgCalibrationLock = Any()
+    private val ecgCalibration = mutableListOf<EcgSample>()
+
     private val ibiWindow = ArrayDeque<IbiWindowEntry>(220)
     // IBI accepted since the previous publish. HR ships in ~4 s bursts and we
     // publish every 1 s, so we cannot rely on a fixed time slice or beats are
@@ -150,6 +166,43 @@ class AcquisitionAssembler(
         }
     }
 
+    /** Buffer one 100 Hz on-demand PPG sample (valence). Flushed once per publish
+     *  tick by [drainPpgOnDemandForPublish] instead of per-callback. */
+    fun addPpgOnDemandSample(ts: Long, green: Int, ir: Int) {
+        synchronized(ppgOnDemandLock) {
+            ppgOnDemand.add(Triple(ts, green, ir))
+            // Cap ~2 s @ 100 Hz x safety so a missed flush can't grow unbounded.
+            while (ppgOnDemand.size > 400) ppgOnDemand.removeAt(0)
+        }
+    }
+
+    /** Drain all on-demand PPG buffered since the previous flush. */
+    fun drainPpgOnDemandForPublish(): List<Triple<Long, Int, Int>> {
+        synchronized(ppgOnDemandLock) {
+            val snap = ppgOnDemand.toList()
+            ppgOnDemand.clear()
+            return snap
+        }
+    }
+
+    /** Buffer one 500 Hz ECG calibration sample. Flushed once per publish tick. */
+    fun addEcgCalibrationSample(ts: Long, mv: Int, leadOff: Int, seq: Int) {
+        synchronized(ecgCalibrationLock) {
+            ecgCalibration.add(EcgSample(ts, mv, leadOff, seq))
+            // Cap ~1.2 s @ 500 Hz x safety so a missed flush can't grow unbounded.
+            while (ecgCalibration.size > 600) ecgCalibration.removeAt(0)
+        }
+    }
+
+    /** Drain all ECG calibration samples buffered since the previous flush. */
+    fun drainEcgCalibrationForPublish(): List<EcgSample> {
+        synchronized(ecgCalibrationLock) {
+            val snap = ecgCalibration.toList()
+            ecgCalibration.clear()
+            return snap
+        }
+    }
+
     /** Drop everything. Called on stop and on baseline recalibration. */
     fun clear() {
         synchronized(bufferLock) {
@@ -160,6 +213,8 @@ class AcquisitionAssembler(
             lastIbiTimestampMs = 0L
         }
         synchronized(ppgBatchLock) { ppgBatch.clear() }
+        synchronized(ppgOnDemandLock) { ppgOnDemand.clear() }
+        synchronized(ecgCalibrationLock) { ecgCalibration.clear() }
         acquisitionSeq = 0L
         lastSkinTempTsMs = 0L
     }

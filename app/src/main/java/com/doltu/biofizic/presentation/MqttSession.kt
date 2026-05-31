@@ -30,6 +30,8 @@ class MqttSession(
     private val onEpochState: (String) -> Unit,
     private val onStateLive: (String) -> Unit,
     private val onCalibrationStatus: (String) -> Unit,
+    /** Handshake reply: the server's ok/error verdict on our announced sensors. */
+    private val onHelloAck: (String) -> Unit = {},
     /** Invoked after [publish] succeeds so the Service can bump a counter. */
     private val onMessagePublished: () -> Unit = {},
 ) {
@@ -78,6 +80,7 @@ class MqttSession(
                             "biofizic/state" -> onEpochState(json)
                             "biofizic/state/live" -> onStateLive(json)
                             "biofizic/calibration/status" -> onCalibrationStatus(json)
+                            "biofizic/hello/ack" -> onHelloAck(json)
                         }
                     } catch (e: Exception) {
                         Log.w(tag, "MQTT parse $topic: ${e.message}")
@@ -91,7 +94,9 @@ class MqttSession(
             client.subscribe("biofizic/state", 1)
             client.subscribe("biofizic/state/live", 0)
             client.subscribe("biofizic/calibration/status", 1)
-            Log.i(tag, "MQTT connected to $brokerUrl (+ state, state/live, calibration/status)")
+            // Handshake reply: QoS 1 so the ack survives a reconnect.
+            client.subscribe("biofizic/hello/ack", 1)
+            Log.i(tag, "MQTT connected to $brokerUrl (+ state, state/live, calibration/status, hello/ack)")
             return true
         } catch (e: Exception) {
             Log.e(tag, "MQTT connect error on $brokerUrl: ${e.message}")
