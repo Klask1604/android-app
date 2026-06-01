@@ -219,7 +219,13 @@
       "Bash(./venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('affectus/shared/feedback_store.py',encoding='utf-8'\\).read\\(\\)\\); print\\('sintaxa OK'\\)\")",
       "Bash(./venv/Scripts/python.exe -m pytest tests/test_feedback.py -q)",
       "Bash(./venv/Scripts/python.exe -c \"import sys; sys.path.insert\\(0,'.'\\); from affectus.shared.feedback_store import default_path; print\\('path:', default_path\\(\\)\\)\")",
-      "Bash(docker inspect *)"
+      "Bash(docker inspect *)",
+      "Bash(./venv/Scripts/python.exe -c \"import ast; [ast.parse\\(open\\(f,encoding='utf-8'\\).read\\(\\)\\) for f in ['services/compute_engine.py','affectus/shared/scene_context.py']]; print\\('OK'\\)\")",
+      "Bash(./venv/Scripts/python.exe -m pytest tests/test_feedback.py tests/test_valence_baseline.py -q)",
+      "Bash(./venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('services/mqtt_logger.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(./venv/Scripts/python.exe -m pytest tests/test_scene_context.py tests/test_feedback.py tests/test_legacy_toggles.py tests/test_valence_baseline.py -q)",
+      "Bash(./venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('services/compute_engine.py',encoding='utf-8'\\).read\\(\\)\\); print\\('sintaxa OK'\\)\")",
+      "Bash(./venv/Scripts/python.exe -m pytest tests/test_scene_context.py tests/test_feedback.py -q)"
     ],
     "additionalDirectories": [
       "c:\\Users\\doltu\\.claude\\projects\\c--Users-doltu-AndroidStudioProjects-biofizic\\memory"
