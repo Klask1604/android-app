@@ -21,3 +21,10 @@ replay_pid*.log
 
 # Android Studio generated
 /app/build/
+
+# Claude Code local config (not project files)
+.claude/
+
+# Debug logcat dumps
+lc3.txt
+*.logcat
