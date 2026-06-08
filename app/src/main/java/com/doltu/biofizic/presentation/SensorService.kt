@@ -61,6 +61,7 @@ class SensorService : Service(), SensorEventListener {
             tag = TAG,
             onEpochState = { parseEpochStateMessage(it) },
             onStateLive = { parseStateLiveMessage(it) },
+            onEmotionState = { parseEmotionStateMessage(it) },
             onCalibrationStatus = { parseCalibrationStatus(it) },
             onHelloAck = { parseHelloAck(it) },
             onMessagePublished = { msgCount++ },
@@ -73,7 +74,7 @@ class SensorService : Service(), SensorEventListener {
     // classify (e.g. skin-temp only) never floods the broker with unusable data.
     // Handshake state. handshakeOk: server replied "ok". handshakeAckReceived:
     // server replied at all (ok OR error). handshakeSentAtMs: when we last
-    // announced — used for the fail-open timeout (stream anyway if no ack) and
+    // announced, used for the fail-open timeout (stream anyway if no ack) and
     // the slow retry (re-announce until the server answers).
     @Volatile private var handshakeOk: Boolean = false
     @Volatile private var handshakeAckReceived: Boolean = false
@@ -85,12 +86,9 @@ class SensorService : Service(), SensorEventListener {
     // ── Samsung Health SDK ──
     private var healthTrackingService: HealthTrackingService? = null
     private var heartRateTracker: HealthTracker? = null
-    private var ppgTracker: HealthTracker? = null
     private var skinTempTracker: HealthTracker? = null
     private var accSdkTracker: HealthTracker? = null
-    private var ecgTracker: HealthTracker? = null  // test-only, on-demand (hold finger)
-    private var ppgOnDemandTracker: HealthTracker? = null  // test-only, 100 Hz raw
-    private var skinTempOnDemandTracker: HealthTracker? = null  // test-only
+    private var ppgOnDemandTracker: HealthTracker? = null  // 100 Hz raw PPG (sole optical tracker)
     private val handler = Handler(Looper.getMainLooper())
 
     // ── Wake lock ──
@@ -115,46 +113,24 @@ class SensorService : Service(), SensorEventListener {
         // Self-reported arousal in [0,1] from the watch questionnaire; anchors
         // where the new baseline sits on the arousal scale.
         const val EXTRA_REPORTED_AROUSAL = "com.doltu.biofizic.EXTRA_REPORTED_AROUSAL"
-        const val EXTRA_REPORTED_VALENCE = "com.doltu.biofizic.EXTRA_REPORTED_VALENCE"
         const val EXTRA_REACTIVITY = "com.doltu.biofizic.EXTRA_REACTIVITY"
 
-        // Raw full-rate firehose for testing: every sensor DataPoint, every value
-        // key the SDK exposes, published as-is on a separate topic — independent of
-        // all production toggles/aggregation. Default OFF in production. Flip ON
-        // for the cardiac-comparator experiment (publishes HR/PPG/acc continuous
-        // dumps on biofizic/test/*). NOT needed for the 100 Hz valence PPG —
-        // that has its own flag below.
-        const val PUBLISH_TEST_DUMP = false
-        const val TEST_TOPIC = "biofizic/test"
-
-        // 100 Hz on-demand PPG for the valence frequency-domain features,
-        // published on its own clean topic (biofizic/ppg/ondemand), independent
-        // of the noisy test dumps above. Empirically on GW7 this runs in
-        // parallel with HR/IBI without starving the HRV pipeline (verified
-        // 2026-05: arousal + valence both live).
+        // 100 Hz on-demand PPG: SINGURUL tracker optic acum. Forma de unda densa
+        // intra direct in acquisition batch (nu mai e topic separat). Pe GW7 ruleaza
+        // in paralel cu HR/IBI fara sa infometeze pipeline-ul HRV (verificat 2026-05:
+        // arousal + valenta amandoua live).
         const val PUBLISH_PPG_ONDEMAND = true
-        const val PPG_ONDEMAND_TOPIC = "biofizic/ppg/ondemand"
 
         // Start the PPG_ON_DEMAND tracker (100 Hz). Gated together with
         // PUBLISH_PPG_ONDEMAND.
         const val START_PPG_ON_DEMAND = true
 
-        // ECG-based calibration: during calibration the user holds a finger on the
-        // button (Lead-I), the watch streams raw 500 Hz ECG to the server which
-        // detects R-peaks -> clean HRV baseline. Decoupled from PUBLISH_TEST_DUMP.
-        const val ECG_CALIBRATE_TOPIC = "biofizic/ecg/calibrate"
-        // A single FIXED window drives the whole ECG step: the progress bar is
-        // elapsed/ECG_WINDOW_MS and at time-up the screen dismisses, finger or not.
-        const val ECG_WINDOW_MS = 45_000L
-        @Volatile var ecgCalibrationActive: Boolean = false
-        @Volatile var ecgCalibrationStartMs: Long = 0L
-        // Last moment the finger was on the button — drives ONLY the live contact
+        // Last moment the finger was on the button, drives ONLY the live contact
         // indicator (green/orange), never the progress or the stop condition.
         @Volatile var lastLeadOnMs: Long = 0L
 
         // Pending self-report to send as a calibration once MQTT is connected.
         @Volatile var pendingReportedArousal: Double = Double.NaN
-        @Volatile var pendingReportedValence: Double = Double.NaN
         @Volatile var pendingReactivity: String? = null
 
         // When we last asked for a (re)calibration. Used to ignore the RETAINED
@@ -284,21 +260,12 @@ class SensorService : Service(), SensorEventListener {
         var emotionVerdict: String
             get() = state.emotionVerdict
             set(value) { state.emotionVerdict = value }
-        var valence: Float
-            get() = state.valence
-            set(value) { state.valence = value }
-        var valenceReady: Boolean
-            get() = state.valenceReady
-            set(value) { state.valenceReady = value }
-        var ecgUiActive: Boolean
-            get() = state.ecgCalibrationActive
-            set(value) { state.ecgCalibrationActive = value }
-        var ecgContact: Boolean
-            get() = state.ecgContact
-            set(value) { state.ecgContact = value }
-        var ecgProgress: Float
-            get() = state.ecgProgress
-            set(value) { state.ecgProgress = value }
+        var emotionScores: String
+            get() = state.emotionScores
+            set(value) { state.emotionScores = value }
+        var emotionConfidence: Float
+            get() = state.emotionConfidence
+            set(value) { state.emotionConfidence = value }
 
         // Compose snapshot
         val uiState: StateFlow<UiState> get() = state.uiState
@@ -347,7 +314,7 @@ class SensorService : Service(), SensorEventListener {
             liveStreamEnabled = { liveStreamEnabled },
             liveWatchEnabled = { liveWatchEnabled },
             onSdkFlush = {
-                ppgTracker?.flush()
+                ppgOnDemandTracker?.flush()
                 skinTempTracker?.flush()
                 accSdkTracker?.flush()
             },
@@ -409,7 +376,7 @@ class SensorService : Service(), SensorEventListener {
                 "BODY_SENSORS_BACKGROUND=$backgroundSensorsGranted, batteryOptIgnored=$batteryOk"
         )
         if (!backgroundSensorsGranted) {
-            Log.w(TAG, "Acordă BODY_SENSORS_BACKGROUND pentru măsurători cu ecranul oprit")
+            Log.w(TAG, "Grant BODY_SENSORS_BACKGROUND for measurements with the screen off")
         }
     }
 
@@ -442,7 +409,7 @@ class SensorService : Service(), SensorEventListener {
     private fun stopPublishLoops() = publishScheduler.stop()
 
     // ══════════════════════════════════════════
-    //  Samsung Health SDK – connection
+    //  Samsung Health SDK: connection
     // ══════════════════════════════════════════
     private val connectionListener = object : ConnectionListener {
         override fun onConnectionSuccess() {
@@ -461,13 +428,12 @@ class SensorService : Service(), SensorEventListener {
     }
 
     // ══════════════════════════════════════════
-    //  Samsung Health SDK – tracker listeners
+    //  Samsung Health SDK: tracker listeners
     // ══════════════════════════════════════════
 
     /** HR + IBI */
     private val heartRateListener = object : HealthTracker.TrackerEventListener {
         override fun onDataReceived(dataPoints: List<DataPoint>) {
-            dumpHrTest(dataPoints)
             val recvMs = System.currentTimeMillis()
             val gapMs = if (lastHrDataMs > 0L) recvMs - lastHrDataMs else 0L
             lastHrDataMs = recvMs
@@ -487,7 +453,7 @@ class SensorService : Service(), SensorEventListener {
                     val hrForNorm = if (hr > 0) hr else lastHr
                     // Evaluate EVERY beat (keep rejected ones too) so timestamp
                     // reconstruction can advance the clock over rejected beats and
-                    // leave a visible gap — otherwise the two surviving neighbours
+                    // leave a visible gap, otherwise the two surviving neighbours
                     // look consecutive and RMSSD is inflated across the dropped beat.
                     val evals = ArrayList<IbiSignalFilter.BeatEval>(ibiList.size)
                     for (i in ibiList.indices) {
@@ -522,7 +488,7 @@ class SensorService : Service(), SensorEventListener {
             logHrBatchIfDue(force = true)
         }
         override fun onError(e: HealthTracker.TrackerError) {
-            Log.w(TAG, "HR tracker eroare: ${e.name} — restart în 3s")
+            Log.w(TAG, "HR tracker error: ${e.name}, restart in 3s")
             ibiActive = false
             heartRateTracker?.unsetEventListener()
             heartRateTracker = null
@@ -532,39 +498,9 @@ class SensorService : Service(), SensorEventListener {
         }
     }
 
-    /** PPG raw – green, IR, red (SDK: ~25 Hz continuous) */
-    private val ppgListener = object : HealthTracker.TrackerEventListener {
-        override fun onDataReceived(dataPoints: List<DataPoint>) {
-            dumpPpgTest(dataPoints)
-            enqueuePpg(dataPoints)
-        }
-        override fun onFlushCompleted() {}
-        override fun onError(e: HealthTracker.TrackerError) {
-            Log.w(TAG, "PPG tracker eroare: ${e.name} — restart în 5s")
-            ppgActive = false
-            ppgTracker?.unsetEventListener()
-            ppgTracker = null
-            handler.postDelayed({
-                if (isRunning) restartPpgTracker()
-            }, 5_000L)
-        }
-    }
 
-    /** ECG raw @ 500 Hz, on-demand (user holds a finger on the button; data flows
-     *  only while LEAD_OFF == 0). During a calibration it is buffered + streamed to
-     *  the server for R-peak -> clean HRV baseline; the test dump path is kept. */
-    private val ecgListener = object : HealthTracker.TrackerEventListener {
-        override fun onDataReceived(dataPoints: List<DataPoint>) {
-            if (ecgCalibrationActive) bufferEcgCalibration(dataPoints)
-            if (PUBLISH_TEST_DUMP) dumpEcgTest(dataPoints)
-        }
-        override fun onFlushCompleted() {}
-        override fun onError(e: HealthTracker.TrackerError) {
-            Log.w(TAG, "ECG tracker eroare: ${e.name}")
-        }
-    }
-
-    /** PPG on-demand @100 Hz — TEST ONLY → biofizic/test/ppg_ondemand. */
+    /** PPG on-demand @ 100 Hz, the sole optical tracker. Dense pulse waveform for
+     *  the morphology (valence) path, drained into the acquisition batch. */
     private val ppgOnDemandListener = object : HealthTracker.TrackerEventListener {
         override fun onDataReceived(dataPoints: List<DataPoint>) {
             // Buffer at 100 Hz; the publish loop flushes ONE aggregated message
@@ -578,21 +514,9 @@ class SensorService : Service(), SensorEventListener {
         }
     }
 
-    /** Skin temperature on-demand — TEST ONLY → biofizic/test/skin_temp_ondemand. */
-    private val skinTempOnDemandListener = object : HealthTracker.TrackerEventListener {
-        override fun onDataReceived(dataPoints: List<DataPoint>) {
-            dumpSkinTempOnDemandTest(dataPoints)
-        }
-        override fun onFlushCompleted() {}
-        override fun onError(e: HealthTracker.TrackerError) {
-            Log.w(TAG, "Skin temp on-demand eroare: ${e.name}")
-        }
-    }
-
     /** Skin temperature */
     private val skinTempListener = object : HealthTracker.TrackerEventListener {
         override fun onDataReceived(dataPoints: List<DataPoint>) {
-            dumpSkinTempTest(dataPoints)
             enqueueSkinTemp(dataPoints)
         }
         override fun onFlushCompleted() {}
@@ -605,12 +529,11 @@ class SensorService : Service(), SensorEventListener {
     /** Accelerometer SDK – raw @ 25 Hz */
     private val accSdkListener = object : HealthTracker.TrackerEventListener {
         override fun onDataReceived(dataPoints: List<DataPoint>) {
-            dumpAccTest(dataPoints)
             enqueueAcc(dataPoints)
         }
         override fun onFlushCompleted() {}
         override fun onError(e: HealthTracker.TrackerError) {
-            Log.w(TAG, "ACC SDK tracker eroare: ${e.name} — restart în 5s")
+            Log.w(TAG, "ACC SDK tracker error: ${e.name}, restart in 5s")
             accActive = false
             accSdkTracker?.unsetEventListener()
             accSdkTracker = null
@@ -625,15 +548,15 @@ class SensorService : Service(), SensorEventListener {
     // ══════════════════════════════════════════
     override fun onCreate() {
         super.onCreate()
-        Log.i(TAG, "Service onCreate (fără startForeground — doar din ACTION_START)")
+        Log.i(TAG, "Service onCreate (no startForeground, only from ACTION_START)")
         acquireWakeLock()
         sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
     }
 
     /**
-     * Android 12+: startForeground() din onCreate / boot / alarm crapă cu
-     * ForegroundServiceStartNotAllowedException. Apelăm doar din onStartCommand
-     * după startForegroundService() din MainActivity.
+     * Android 12+: startForeground() from onCreate / boot / alarm crashes with
+     * ForegroundServiceStartNotAllowedException. Call it only from onStartCommand
+     * after startForegroundService() from MainActivity.
      */
     private fun promoteToForeground(notificationId: Int, contentText: String): Boolean {
         if (inForeground) return true
@@ -700,7 +623,7 @@ class SensorService : Service(), SensorEventListener {
                     // Defer until MQTT connects.
                     pendingReportedArousal = reported
                     pendingReactivity = reactivity
-                    Log.w(TAG, "Recalibrare amânată: MQTT inactiv")
+                    Log.w(TAG, "Recalibration deferred: MQTT inactive")
                 }
                 return START_STICKY
             }
@@ -710,10 +633,10 @@ class SensorService : Service(), SensorEventListener {
                 return START_STICKY
             }
             else -> {
-                // Restart automat START_STICKY (intent null) sau boot — reia tracking-ul
-                Log.i(TAG, "onStartCommand restart (action=${intent?.action}) — reia tracking")
+                // Automatic START_STICKY restart (null intent) or boot: resume tracking
+                Log.i(TAG, "onStartCommand restart (action=${intent?.action}), reia tracking")
                 if (!promoteToForeground(1, "HR · PPG · ACC · Gyro · Temp")) {
-                    Log.w(TAG, "Restart: startForeground eșuat — oprire")
+                    Log.w(TAG, "Restart: startForeground failed, stopping")
                     stopSelf()
                     return START_NOT_STICKY
                 }
@@ -731,7 +654,7 @@ class SensorService : Service(), SensorEventListener {
         registerScreenReceiver()
         logTrackingReadiness()
         buildAndroidSensorInventory()
-        // Android sensors: Gyro only (step counter removed — unused in thesis pipeline)
+        // Android sensors: Gyro only (step counter removed, unused in thesis pipeline)
         registerAndroidSensors()
 
         // MQTT + Samsung SDK pe thread separat
@@ -775,7 +698,8 @@ class SensorService : Service(), SensorEventListener {
         if (heartRateTracker != null) { caps.add("ibi"); caps.add("hr") }
         if (accSdkTracker != null || hasAndroidAccelerometer()) caps.add("motion")
         if (skinTempTracker != null) caps.add("temp")
-        if (AcquisitionAssembler.PUBLISH_RAW_PPG && ppgTracker != null) caps.add("ppg")
+        // "ppg" = forma de unda densa 100 Hz (de la PPG_ON_DEMAND, singurul tracker optic).
+        if (AcquisitionAssembler.PUBLISH_RAW_PPG && ppgOnDemandTracker != null) caps.add("ppg")
         return caps
     }
 
@@ -824,10 +748,10 @@ class SensorService : Service(), SensorEventListener {
         if (healthTrackingService == null) {
             lines.appendLine("  SDK neconectat")
         } else if (capabilities.isEmpty()) {
-            lines.appendLine("  (listă goală)")
+            lines.appendLine("  (empty list)")
         } else {
             for (type in HealthTrackerType.values()) {
-                val tag = if (type in capabilities) "✓ în capabilities" else "– indisponibil"
+                val tag = if (type in capabilities) "available" else "unavailable"
                 lines.appendLine("  $type: $tag")
             }
             lines.appendLine()
@@ -863,7 +787,7 @@ class SensorService : Service(), SensorEventListener {
         Log.i(TAG, "Capabilities: $capabilities")
         var count = 0
 
-        // HR + IBI – încearcă continuous, apoi on-demand
+        // HR + IBI: try continuous, then on-demand
         for (hrType in listOf(
             HealthTrackerType.HEART_RATE_CONTINUOUS,
             HealthTrackerType.HEART_RATE
@@ -881,23 +805,11 @@ class SensorService : Service(), SensorEventListener {
         }
         if (heartRateTracker == null) Log.w(TAG, "No HR tracker type available")
 
-        for (ppgMode in listOf(
-            HealthTrackerType.PPG_CONTINUOUS,
-            HealthTrackerType.PPG_ON_DEMAND
-        )) {
-            if (ppgMode !in capabilities) continue
-            ppgTracker = obtainPpgTracker(ppgMode)
-            if (ppgTracker != null) {
-                handler.post { ppgTracker?.setEventListener(ppgListener) }
-                ppgActive = true
-                count++
-                Log.i(TAG, "✓ PPG tracker pornit ($ppgMode, canale=$ppgChannelTypes)")
-                break
-            }
-        }
-        if (ppgTracker == null) Log.w(TAG, "✗ PPG indisponibil (GREEN+IR+RED)")
+        // The dense PPG waveform comes solely from PPG_ON_DEMAND (100 Hz, started
+        // below); a single optical tracker saves battery. IBI/HR come from their
+        // own trackers and are unaffected.
 
-        // SKIN_TEMPERATURE_CONTINUOUS există pe GW7; ON_DEMAND e fallback (~1 măsurătoare)
+        // SKIN_TEMPERATURE_CONTINUOUS exists on GW7; ON_DEMAND is the fallback.
         for (tempMode in listOf(
             HealthTrackerType.SKIN_TEMPERATURE_CONTINUOUS,
             HealthTrackerType.SKIN_TEMPERATURE_ON_DEMAND
@@ -913,23 +825,11 @@ class SensorService : Service(), SensorEventListener {
             }
         }
         if (skinTempTracker == null) {
-            Log.w(TAG, "✗ Skin temp indisponibil (lipsește CONTINUOUS și ON_DEMAND)")
+            Log.w(TAG, "Skin temp unavailable (no CONTINUOUS or ON_DEMAND)")
         }
 
-        // ECG — TEST ONLY: on-demand, requires the user to hold a finger on the
-        // button. Started only with the test firehose on; raw 500 Hz → biofizic/test/ecg.
-        if (PUBLISH_TEST_DUMP && HealthTrackerType.ECG_ON_DEMAND in capabilities) {
-            ecgTracker = obtainTracker(HealthTrackerType.ECG_ON_DEMAND)
-            if (ecgTracker != null) {
-                handler.post { ecgTracker?.setEventListener(ecgListener) }
-                count++
-                Log.i(TAG, "✓ ECG tracker pornit (ON_DEMAND, test — ține degetul pe buton)")
-            }
-        } else if (PUBLISH_TEST_DUMP) {
-            Log.w(TAG, "✗ ECG_ON_DEMAND indisponibil pe acest dispozitiv")
-        }
 
-        // PPG on-demand @100 Hz — TEST ONLY. Gated by START_PPG_ON_DEMAND
+        // PPG on-demand @100 Hz, TEST ONLY. Gated by START_PPG_ON_DEMAND
         // because on Galaxy Watch 7 this tracker silently blocks
         // HEART_RATE_CONTINUOUS from emitting IBI bursts, starving the server
         // HRV pipeline. Enable only for the cardiac-comparator experiment.
@@ -939,17 +839,7 @@ class SensorService : Service(), SensorEventListener {
             if (ppgOnDemandTracker != null) {
                 handler.post { ppgOnDemandTracker?.setEventListener(ppgOnDemandListener) }
                 count++
-                Log.i(TAG, "✓ PPG on-demand pornit (100 Hz → $PPG_ONDEMAND_TOPIC)")
-            }
-        }
-
-        // Skin temperature on-demand — TEST ONLY (single-shot vs the continuous one).
-        if (PUBLISH_TEST_DUMP && HealthTrackerType.SKIN_TEMPERATURE_ON_DEMAND in capabilities) {
-            skinTempOnDemandTracker = obtainTracker(HealthTrackerType.SKIN_TEMPERATURE_ON_DEMAND)
-            if (skinTempOnDemandTracker != null) {
-                handler.post { skinTempOnDemandTracker?.setEventListener(skinTempOnDemandListener) }
-                count++
-                Log.i(TAG, "✓ Skin temp on-demand pornit (test)")
+                Log.i(TAG, "✓ PPG on-demand pornit (100 Hz → acquisition batch)")
             }
         }
 
@@ -970,7 +860,7 @@ class SensorService : Service(), SensorEventListener {
             "MQTT: acquisition/batch at ${mqttPublishIntervalMs}ms"
         )
         // Do NOT start streaming yet. Announce our sensors and wait for the
-        // server's ok on biofizic/hello/ack — parseHelloAck() starts the publish
+        // server's ok on biofizic/hello/ack, parseHelloAck() starts the publish
         // loops once accepted. This makes the contract server-enforced: a device
         // the server can't classify never streams.
         publishHello()
@@ -995,33 +885,15 @@ class SensorService : Service(), SensorEventListener {
         handler.postDelayed({ if (isRunning) restartHrTracker() }, 10_000L)
     }
 
-    private fun restartPpgTracker() {
-        val capabilities = samsungCapabilities()
-        for (ppgMode in listOf(
-            HealthTrackerType.PPG_CONTINUOUS,
-            HealthTrackerType.PPG_ON_DEMAND
-        )) {
-            if (ppgMode !in capabilities) continue
-            val tracker = obtainPpgTracker(ppgMode) ?: continue
-            ppgTracker = tracker
-            handler.post { ppgTracker?.setEventListener(ppgListener) }
-            ppgActive = true
-            Log.i(TAG, "PPG tracker restartat ($ppgMode)")
-            return
-        }
-        Log.e(TAG, "PPG tracker restart eșuat — retry în 10s")
-        handler.postDelayed({ if (isRunning) restartPpgTracker() }, 10_000L)
-    }
-
     private fun restartAccTracker() {
         val capabilities = samsungCapabilities()
         if (HealthTrackerType.ACCELEROMETER_CONTINUOUS !in capabilities) {
-            Log.e(TAG, "ACC tracker restart eșuat — tip indisponibil")
+            Log.e(TAG, "ACC tracker restart failed, type unavailable")
             return
         }
         val tracker = obtainTracker(HealthTrackerType.ACCELEROMETER_CONTINUOUS)
         if (tracker == null) {
-            Log.e(TAG, "ACC tracker restart eșuat — retry în 10s")
+            Log.e(TAG, "ACC tracker restart failed, retry in 10s")
             handler.postDelayed({ if (isRunning) restartAccTracker() }, 10_000L)
             return
         }
@@ -1068,12 +940,6 @@ class SensorService : Service(), SensorEventListener {
                         event.values[2] * event.values[2]
                 ).toDouble()
                 assembler.addGyroSample(ts, gMag)
-                if (PUBLISH_TEST_DUMP) {
-                    publishTestDump(
-                        "gyroscope",
-                        """[{"ts":$ts,"x":${event.values[0]},"y":${event.values[1]},"z":${event.values[2]}}]""",
-                    )
-                }
             }
         }
     }
@@ -1104,7 +970,7 @@ class SensorService : Service(), SensorEventListener {
         val capsJson = caps.joinToString(",") { "\"$it\"" }
         val payload = "{\"client_id\":\"$CLIENT_ID\",\"schema\":2," +
             "\"capabilities\":[$capsJson],\"profile\":\"wrist_ppg\"}"
-        mqttSession.publish("biofizic/hello", payload)
+        mqttSession.publish(Topics.In.HELLO, payload)
         handshakeSentAtMs = System.currentTimeMillis()
         Log.i(TAG, "handshake: announced $caps")
     }
@@ -1117,7 +983,7 @@ class SensorService : Service(), SensorEventListener {
         if (streamingStarted || handshakeRejected) return
         val waited = System.currentTimeMillis() - handshakeSentAtMs
         if (handshakeSentAtMs > 0 && waited >= HANDSHAKE_FAIL_OPEN_MS) {
-            Log.w(TAG, "handshake: no ack in ${waited}ms — streaming anyway (fail-open)")
+            Log.w(TAG, "handshake: no ack in ${waited}ms, streaming anyway (fail-open)")
             startStreaming()
         }
     }
@@ -1129,7 +995,7 @@ class SensorService : Service(), SensorEventListener {
         if (handshakeAckReceived || !isMqttConnected || heartRateTracker == null) return
         if (handshakeSentAtMs > 0 &&
             System.currentTimeMillis() - handshakeSentAtMs >= HANDSHAKE_RETRY_MS) {
-            Log.i(TAG, "handshake: no ack yet — re-announcing")
+            Log.i(TAG, "handshake: no ack yet, re-announcing")
             publishHello()
         }
     }
@@ -1155,7 +1021,7 @@ class SensorService : Service(), SensorEventListener {
             } else {
                 // Explicit rejection (e.g. too few sensors to classify): stop
                 // streaming and surface the reason. This is the ONLY case that
-                // halts data — a silent/absent server never does (fail-open).
+                // halts data, a silent/absent server never does (fail-open).
                 handshakeOk = false
                 handshakeRejected = true
                 Log.w(TAG, "handshake REJECTED: $handshakeReason")
@@ -1168,19 +1034,6 @@ class SensorService : Service(), SensorEventListener {
         }
     }
 
-
-    private fun enqueuePpg(dataPoints: List<DataPoint>) {
-        // Raw PPG feeds production only indirectly (cardiac-band energy is from
-        // the accelerometer). It is buffered into the acquisition batch only for
-        // the server's research/legacy peak-detection demos, behind the
-        // PUBLISH_RAW_PPG toggle. Off by default to save bandwidth/power.
-        if (!AcquisitionAssembler.PUBLISH_RAW_PPG) return
-        for (dp in dataPoints) {
-            val g = dp.getValue(ValueKey.PpgSet.PPG_GREEN)
-            val ir = dp.getValue(ValueKey.PpgSet.PPG_IR)
-            assembler.addPpgSample(dp.timestamp, g, ir)
-        }
-    }
 
     private fun enqueueSkinTemp(dataPoints: List<DataPoint>) {
         for (dp in dataPoints) {
@@ -1292,6 +1145,14 @@ class SensorService : Service(), SensorEventListener {
     ) {
         val ts = System.currentTimeMillis()
         calibrateRequestedAtMs = ts  // anything older than this is stale/retained
+        // Re-announce capabilities first. The hello is not retained, so if the
+        // server missed the initial handshake (engine restart, lost message) it
+        // never set this device's capabilities and never produces a verdict.
+        // A recalibration is the natural point to re-declare them: idempotent, and
+        // it guarantees the server has the capability set before it locks the new
+        // baseline. Without this, a recalibration could re-collect rest samples but
+        // still yield no verdict.
+        publishHello()
         val arousalJson =
             if (reportedArousal.isNaN()) "" else ""","reported_arousal":$reportedArousal"""
         // Reactivity (low|normal|high) sets the one-time emotional-responsiveness
@@ -1299,17 +1160,19 @@ class SensorService : Service(), SensorEventListener {
         val reactivityJson =
             if (reactivity in listOf("low", "normal", "high")) ""","reactivity":"$reactivity"""" else ""
         publish(
-            "biofizic/cmd/calibrate",
+            Topics.In.CMD_CALIBRATE,
             """{"ts":$ts,"action":"profile","source":"watch"$arousalJson$reactivityJson}""",
         )
         calibrationPhase = "collecting"
-        calibrationMessage = "Recalibrare… stai liniștit 1–2 min"
+        calibrationMessage = "Recalibrare... stai liniștit 1-2 min"
         syncUiState()  // push "collecting" to Compose so the spinner shows now
-        Log.i(TAG, "Recalibrare trimisă (arousal=$reportedArousal, reactivity=$reactivity)")
+        Log.i(TAG, "Recalibration sent (arousal=$reportedArousal, reactivity=$reactivity)")
     }
 
-    /** Publish a user emotion-feedback label (a Russell quadrant). The server
-     *  pairs it with the recent PPG features for the watch-native labelled set.
+    /** Publish a user emotion-feedback label (one of the 3 model states: Calm /
+     *  Disconfort / Placut). The server pairs it with the live model feature
+     *  vectors for the watch-native labelled set and the personal retrain loop.
+     *  The JSON key stays "quadrant" for server back-compat.
      *  Fire-and-forget: a missed label is harmless, no spinner / state change. */
     private fun sendEmotionFeedback(quadrant: String) {
         if (!isMqttConnected) {
@@ -1318,14 +1181,14 @@ class SensorService : Service(), SensorEventListener {
         }
         val ts = System.currentTimeMillis()
         publish(
-            "biofizic/cmd/feedback",
+            Topics.In.CMD_FEEDBACK,
             """{"ts":$ts,"action":"emotion","quadrant":"$quadrant","source":"watch"}""",
         )
         Log.i(TAG, "Feedback trimis: $quadrant")
     }
 
     /** Send a deferred self-report calibration once MQTT is live. Only armed by a
-     *  recalibrate request that hit while MQTT was down — a plain start never sets
+     *  recalibrate request that hit while MQTT was down, a plain start never sets
      *  pendingReportedArousal, so this can no longer recalibrate on start. */
     private fun flushPendingCalibration() {
         if (!pendingReportedArousal.isNaN() && isRunning && isMqttConnected) {
@@ -1345,7 +1208,7 @@ class SensorService : Service(), SensorEventListener {
             if (calibrateRequestedAtMs > 0L &&
                 msgTs in 1 until (calibrateRequestedAtMs - CALIBRATION_STALE_MARGIN_MS)
             ) {
-                Log.i(TAG, "Ignor status calibrare învechit (ts=$msgTs < cerere=$calibrateRequestedAtMs)")
+                Log.i(TAG, "Ignoring stale calibration status (ts=$msgTs < request=$calibrateRequestedAtMs)")
                 return
             }
             calibrationPhase = obj.optString("phase", "")
@@ -1354,7 +1217,7 @@ class SensorService : Service(), SensorEventListener {
                 profileReady = obj.optBoolean("profile_ready", profileReady)
             }
             if (calibrationPhase == "rejected") {
-                Log.w(TAG, "Recalibrare respinsă: $calibrationMessage")
+                Log.w(TAG, "Recalibration rejected: $calibrationMessage")
             }
             syncUiState()
         } catch (e: JSONException) {
@@ -1375,7 +1238,7 @@ class SensorService : Service(), SensorEventListener {
         }
         // Server honesty flag: "preliminary" (Kubios population fallback,
         // confidence capped at 0.5) vs "calibrated" (personal-z CDF). Empty
-        // means an older server build — fall back to assuming calibrated so
+        // means an older server build, fall back to assuming calibrated so
         // we never accidentally label real calibrated verdicts as preliminary.
         val fidelity = obj.optString("decision_fidelity", "")
         if (fidelity.isNotEmpty()) {
@@ -1421,6 +1284,46 @@ class SensorService : Service(), SensorEventListener {
         }
     }
 
+    /** Emotion verdict from biofizic/out/emotion: a human-named state (Relaxat /
+     * Normal / Activat / Bucuros / Stresat) plus typical emotions, and the raw
+     * arousal (1-10) + valence (-1..+1) scores shown small under the verdict so
+     * the user sees what the verdict is based on. Ignores the "CALIBRARE"
+     * placeholder so the UI doesn't flash it while the baseline is still locking. */
+    private fun parseEmotionStateMessage(json: String) {
+        try {
+            val obj = JSONObject(json)
+            val state = obj.optString("state", "").trim()
+            if (state.isEmpty() || state == "CALIBRARE") return
+            val emotions = obj.optJSONArray("emotions")
+            val typical = if (emotions != null && emotions.length() > 0) {
+                (0 until emotions.length()).joinToString(" / ") { emotions.optString(it) }
+            } else {
+                ""
+            }
+            // The verdict is the bare state name; typical emotions go to the UI
+            // separately so the layout can size the headline on its own.
+            emotionVerdict = state
+            // Both axes are always shown. Arousal is always measured; valence is shown
+            // with a "~" marker when the server could not assert it reliably (most of
+            // the time: only high arousal + morphology makes it reliable), so the user
+            // always sees two numbers but knows which one is uncertain.
+            val arousal = obj.optDouble("arousal_y", -1.0)
+            val valence = obj.optDouble("valence_x", 0.0)
+            val valenceReliable = obj.optBoolean("valence_reliable", false)
+            emotionScores = buildString {
+                if (arousal >= 0) append("activare ${arousal.toInt()}")
+                val vMark = if (valenceReliable) "" else "~"
+                append("  ·  ${vMark}valenta ${"%+.1f".format(valence)}")
+            }
+            // The verdict's OWN confidence (from the Russell mapping), distinct from
+            // the arousal confidence shown elsewhere.
+            emotionConfidence = obj.optDouble("confidence", 0.0).toFloat()
+            syncUiState()
+        } catch (e: JSONException) {
+            Log.w(TAG, "parseEmotionStateMessage: ${e.message}")
+        }
+    }
+
     private fun publishSensorBatches() {
         if (!liveStreamEnabled || !liveWatchEnabled) return
         val tsPublish = System.currentTimeMillis()
@@ -1437,8 +1340,11 @@ class SensorService : Service(), SensorEventListener {
 
         val accBandCardiac = assembler.computeCardiacBandEnergy(tsPublish)
         val ibiSlice = assembler.drainIbiForPublish(tsPublish)
+        // PPG-ul din batch vine acum din bufferul 100 Hz (un singur tracker optic).
+        // Acumulat la 100 Hz pe tick, trimis o data/sec in acelasi batch, radio se
+        // trezeste 1x/sec, iar morfologia/valenta primesc forma de unda densa.
         val ppgSnapshot =
-            if (AcquisitionAssembler.PUBLISH_RAW_PPG) assembler.drainPpgForPublish()
+            if (AcquisitionAssembler.PUBLISH_RAW_PPG) assembler.drainPpgOnDemandForPublish()
             else emptyList()
         val payload = assembler.buildAcquisitionPayload(
             tsPublish = tsPublish,
@@ -1451,12 +1357,7 @@ class SensorService : Service(), SensorEventListener {
             ambientTempC = lastAmbientTempC,
             ppgSnapshot = ppgSnapshot,
         )
-        publish("biofizic/acquisition/batch", payload.json)
-        // Flush the 100 Hz on-demand PPG accumulated this tick as ONE message,
-        // on the same ~1 s cadence — the radio wakes once here instead of ~70x/s.
-        flushPpgOnDemand()
-        // During a calibration finger-hold, flush the buffered 500 Hz ECG too.
-        flushEcgCalibration()
+        publish(Topics.In.ACQUISITION, payload.json)
         if (payload.ibiCount > 0) {
             Log.i(
                 TAG,
@@ -1471,231 +1372,45 @@ class SensorService : Service(), SensorEventListener {
     }
 
     // ══════════════════════════════════════════
-    //  TEST firehose — raw, full-rate, all params, on biofizic/test
+    //  TEST firehose, raw, full-rate, all params, on biofizic/test
     // ══════════════════════════════════════════
 
-    /** Publish one full-resolution batch (all DataPoints from a callback) on a
-     *  per-sensor topic: biofizic/test/<sensor>. Numeric-only payloads. */
-    private fun publishTestDump(sensor: String, samplesJson: String) {
-        if (!PUBLISH_TEST_DUMP || !isMqttConnected) return
-        publish(
-            "$TEST_TOPIC/$sensor",
-            """{"recv_ms":${System.currentTimeMillis()},"samples":$samplesJson}""",
-        )
-    }
-
-    private fun dumpHrTest(dataPoints: List<DataPoint>) {
-        if (!PUBLISH_TEST_DUMP) return
-        val sb = StringBuilder("[")
-        for ((i, dp) in dataPoints.withIndex()) {
-            if (i > 0) sb.append(',')
-            val hr = dp.getValue(ValueKey.HeartRateSet.HEART_RATE)
-            val st = dp.getValue(ValueKey.HeartRateSet.HEART_RATE_STATUS)
-            val ibi = dp.getValue(ValueKey.HeartRateSet.IBI_LIST)
-            val ibiSt = dp.getValue(ValueKey.HeartRateSet.IBI_STATUS_LIST)
-            sb.append("""{"ts":${dp.timestamp},"hr":$hr,"hr_status":$st,""")
-            sb.append(""""ibi":${ibi?.toString() ?: "[]"},"ibi_status":${ibiSt?.toString() ?: "[]"}}""")
-        }
-        sb.append(']')
-        publishTestDump("heart_rate_continuous", sb.toString())
-    }
-
-    private fun dumpPpgTest(dataPoints: List<DataPoint>) {
-        if (!PUBLISH_TEST_DUMP) return
-        val sb = StringBuilder("[")
-        for ((i, dp) in dataPoints.withIndex()) {
-            if (i > 0) sb.append(',')
-            val g = dp.getValue(ValueKey.PpgSet.PPG_GREEN)
-            val ir = dp.getValue(ValueKey.PpgSet.PPG_IR)
-            val red = try { dp.getValue(ValueKey.PpgSet.PPG_RED).toString() } catch (e: Exception) { "null" }
-            sb.append("""{"ts":${dp.timestamp},"green":$g,"ir":$ir,"red":$red}""")
-        }
-        sb.append(']')
-        publishTestDump("ppg_continuous", sb.toString())
-    }
-
-    private fun dumpAccTest(dataPoints: List<DataPoint>) {
-        if (!PUBLISH_TEST_DUMP) return
-        val sb = StringBuilder("[")
-        for ((i, dp) in dataPoints.withIndex()) {
-            if (i > 0) sb.append(',')
-            val x = dp.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_X)
-            val y = dp.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_Y)
-            val z = dp.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_Z)
-            sb.append("""{"ts":${dp.timestamp},"x":$x,"y":$y,"z":$z}""")
-        }
-        sb.append(']')
-        publishTestDump("accelerometer_continuous", sb.toString())
-    }
-
-    private fun dumpEcgTest(dataPoints: List<DataPoint>) {
-        if (!PUBLISH_TEST_DUMP) return
-        val sb = StringBuilder("[")
-        for ((i, dp) in dataPoints.withIndex()) {
-            if (i > 0) sb.append(',')
-            val mv = dp.getValue(ValueKey.EcgSet.ECG_MV)
-            val lead = dp.getValue(ValueKey.EcgSet.LEAD_OFF)
-            val seq = dp.getValue(ValueKey.EcgSet.SEQUENCE)
-            val pg = dp.getValue(ValueKey.EcgSet.PPG_GREEN)
-            sb.append("""{"ts":${dp.timestamp},"ecg_mv":$mv,"lead_off":$lead,"seq":$seq,"ppg_green":$pg}""")
-        }
-        sb.append(']')
-        publishTestDump("ecg", sb.toString())
-    }
-
-    /** Buffer 100 Hz on-demand PPG samples (no publish here — flushed per tick). */
+    /** Buffer 100 Hz on-demand PPG samples (no publish here, flushed per tick). */
     private fun bufferPpgOnDemand(dataPoints: List<DataPoint>) {
         if (!PUBLISH_PPG_ONDEMAND) return
-        for (dp in dataPoints) {
+        // The Samsung SDK delivers a BATCH of samples per callback, all stamped
+        // with the same ARRIVAL time (dp.timestamp) rather than each sample's
+        // capture time. Stored verbatim, ~11 samples share one timestamp and then
+        // jump ~57 ms, which destroys pulse morphology (the extractor cannot
+        // reconstruct the waveform when 11 points have identical times). Re-space
+        // the batch evenly over the gap since the previous batch so the per-sample
+        // timestamps reflect the true 100 Hz capture cadence.
+        val n = dataPoints.size
+        if (n == 0) return
+        val batchTs = dataPoints[0].timestamp
+        val prev = lastPpgOnDemandBatchTs
+        // Span = time since the previous batch; fall back to n*10 ms (100 Hz) on
+        // the first batch or an implausible gap, so samples never collapse.
+        val span = if (prev > 0 && batchTs > prev && batchTs - prev < 1000)
+            (batchTs - prev) else (n * 10L)
+        val step = if (n > 1) span.toDouble() / n else 0.0
+        // Anchor so the batch ENDS at its arrival time (the most recent sample is
+        // "now"); earlier samples are stepped back. Keeps timestamps monotonic.
+        val start = batchTs - (span - (span / n))
+        for ((i, dp) in dataPoints.withIndex()) {
             val g = dp.getValue(ValueKey.PpgSet.PPG_GREEN)
             val ir = dp.getValue(ValueKey.PpgSet.PPG_IR)
-            assembler.addPpgOnDemandSample(dp.timestamp, g, ir)
+            val ts = (start + (i * step)).toLong()
+            assembler.addPpgOnDemandSample(ts, g, ir)
         }
+        lastPpgOnDemandBatchTs = batchTs
     }
 
-    /** Flush all buffered on-demand PPG as ONE aggregated message. Called once
-     *  per publish tick (~1 s) by the scheduler, collapsing ~70 radio wake-ups/s
-     *  into one. Same {recv_ms, samples:[...]} envelope the server already parses. */
-    private fun flushPpgOnDemand() {
-        if (!PUBLISH_PPG_ONDEMAND || !isMqttConnected) return
-        val samples = assembler.drainPpgOnDemandForPublish()
-        if (samples.isEmpty()) return
-        val sb = StringBuilder("[")
-        for ((i, s) in samples.withIndex()) {
-            if (i > 0) sb.append(',')
-            sb.append("""{"ts":${s.first},"green":${s.second},"ir":${s.third}}""")
-        }
-        sb.append(']')
-        publish(
-            PPG_ONDEMAND_TOPIC,
-            """{"recv_ms":${System.currentTimeMillis()},"samples":$sb}""",
-        )
-    }
-
-    // ── ECG-based calibration ────────────────────────────────────────────────
-
-    /** Buffer 500 Hz ECG samples during calibration (flushed per tick). Tracks
-     *  the last moment the lead was ON so a persistent finger-off stops the hold. */
-    private fun bufferEcgCalibration(dataPoints: List<DataPoint>) {
-        val now = System.currentTimeMillis()
-        var anyOn = false
-        for (dp in dataPoints) {
-            // ECG_MV is a Float in µV-ish units; scale ×1000 and round so the
-            // integer waveform keeps full R-peak shape for server-side detection.
-            val mv = Math.round(dp.getValue(ValueKey.EcgSet.ECG_MV) * 1000f)
-            val lead = dp.getValue(ValueKey.EcgSet.LEAD_OFF)
-            val seq = dp.getValue(ValueKey.EcgSet.SEQUENCE)
-            if (lead == 0) { lastLeadOnMs = now; anyOn = true }
-            assembler.addEcgCalibrationSample(dp.timestamp, mv, lead, seq)
-        }
-        // Live contact indicator only — progress is driven by the fixed timer in
-        // flushEcgCalibration, fully decoupled from contact so the bar never sticks.
-        ecgContact = anyOn
-        syncUiState()
-    }
-
-    /** Start streaming ECG for the calibration finger-hold. Gated on ECG_ON_DEMAND
-     *  availability; if absent, logs and returns so the existing PPG resting
-     *  collection completes calibration (graceful fallback). */
-    private fun startEcgCalibration() {
-        if (ecgCalibrationActive) return
-        if (HealthTrackerType.ECG_ON_DEMAND !in samsungCapabilities()) {
-            Log.w(TAG, "ECG calibrare indisponibilă — fallback pe PPG")
-            return
-        }
-        val now = System.currentTimeMillis()
-        ecgCalibrationActive = true
-        ecgCalibrationStartMs = now
-        lastLeadOnMs = now
-        assembler.drainEcgCalibrationForPublish()  // start clean
-        if (ecgTracker == null) ecgTracker = obtainTracker(HealthTrackerType.ECG_ON_DEMAND)
-        ecgTracker?.let { tr -> handler.post { tr.setEventListener(ecgListener) } }
-        // Drive the dedicated ECG screen (the Activity keeps the screen on and
-        // shows the progress bar while ecgCalibrationActive is true).
-        ecgUiActive = true
-        ecgContact = false
-        ecgProgress = 0f
-        syncUiState()
-        Log.i(TAG, "ECG calibrare pornită (fereastră ${ECG_WINDOW_MS}ms)")
-    }
-
-    /** Stop the ECG calibration hold: unset the tracker, clear flags + buffer. */
-    private fun stopEcgCalibration() {
-        if (!ecgCalibrationActive && ecgTracker == null) return
-        ecgCalibrationActive = false
-        ecgCalibrationStartMs = 0L
-        handler.post { ecgTracker?.unsetEventListener() }
-        ecgTracker = null
-        assembler.drainEcgCalibrationForPublish()
-        ecgUiActive = false
-        ecgContact = false
-        syncUiState()
-        Log.i(TAG, "ECG calibrare oprită")
-    }
-
-    /** The single deterministic ECG driver, called once per ~1 s publish tick.
-     *  The progress bar is elapsed/ECG_WINDOW_MS and ALWAYS advances; at time-up
-     *  we send the final chunk and dismiss the screen immediately, finger or not
-     *  (the recording for the baseline is done). One stop condition, no race. */
-    private fun flushEcgCalibration() {
-        if (!ecgCalibrationActive) return
-        val now = System.currentTimeMillis()
-        val elapsed = now - ecgCalibrationStartMs
-        val timeUp = elapsed >= ECG_WINDOW_MS
-        ecgProgress = (elapsed.toFloat() / ECG_WINDOW_MS).coerceIn(0f, 1f)
-        if (isMqttConnected) {
-            val samples = assembler.drainEcgCalibrationForPublish()
-            if (samples.isNotEmpty()) {
-                val sb = StringBuilder("[")
-                for ((i, s) in samples.withIndex()) {
-                    if (i > 0) sb.append(',')
-                    sb.append("""{"ts":${s.ts},"ecg_mv":${s.mv},"lead_off":${s.leadOff},"seq":${s.seq}}""")
-                }
-                sb.append(']')
-                val final = if (timeUp) "true" else "false"
-                publish(
-                    ECG_CALIBRATE_TOPIC,
-                    """{"recv_ms":$now,"samples":$sb,"final":$final}""",
-                )
-            }
-        }
-        syncUiState()
-        if (timeUp) {
-            Log.i(TAG, "ECG calibrare gata (fereastra de ${ECG_WINDOW_MS}ms expirat)")
-            stopEcgCalibration()
-        }
-    }
-
-    private fun dumpSkinTempOnDemandTest(dataPoints: List<DataPoint>) {
-        if (!PUBLISH_TEST_DUMP) return
-        val sb = StringBuilder("[")
-        for ((i, dp) in dataPoints.withIndex()) {
-            if (i > 0) sb.append(',')
-            val skin = dp.getValue(ValueKey.SkinTemperatureSet.OBJECT_TEMPERATURE)
-            val amb = dp.getValue(ValueKey.SkinTemperatureSet.AMBIENT_TEMPERATURE)
-            val st = dp.getValue(ValueKey.SkinTemperatureSet.STATUS)
-            sb.append("""{"ts":${dp.timestamp},"object_temp":$skin,"ambient_temp":$amb,"status":$st}""")
-        }
-        sb.append(']')
-        publishTestDump("skin_temp_ondemand", sb.toString())
-    }
-
-    private fun dumpSkinTempTest(dataPoints: List<DataPoint>) {
-        if (!PUBLISH_TEST_DUMP) return
-        val sb = StringBuilder("[")
-        for ((i, dp) in dataPoints.withIndex()) {
-            if (i > 0) sb.append(',')
-            val skin = dp.getValue(ValueKey.SkinTemperatureSet.OBJECT_TEMPERATURE)
-            val amb = dp.getValue(ValueKey.SkinTemperatureSet.AMBIENT_TEMPERATURE)
-            val st = dp.getValue(ValueKey.SkinTemperatureSet.STATUS)
-            sb.append("""{"ts":${dp.timestamp},"object_temp":$skin,"ambient_temp":$amb,"status":$st}""")
-        }
-        sb.append(']')
-        publishTestDump("skin_temperature", sb.toString())
-    }
+    // Arrival time of the previous PPG on-demand batch, to re-space samples.
+    private var lastPpgOnDemandBatchTs: Long = 0L
 
     // ══════════════════════════════════════════
-    //  Watchdog – reconectare MQTT + SDK
+    //  Watchdog: MQTT + SDK reconnection
     // ══════════════════════════════════════════
     private fun startWatchdog() {
         watchdogThread = Thread.currentThread()
@@ -1803,13 +1518,9 @@ class SensorService : Service(), SensorEventListener {
 
         // Samsung SDK trackers
         heartRateTracker?.unsetEventListener()
-        ppgTracker?.unsetEventListener()
         skinTempTracker?.unsetEventListener()
         accSdkTracker?.unsetEventListener()
-        ecgTracker?.unsetEventListener()
-        ecgCalibrationActive = false
         ppgOnDemandTracker?.unsetEventListener()
-        skinTempOnDemandTracker?.unsetEventListener()
         healthTrackingService?.disconnectService()
         healthTrackingService = null
         resetSdkState()
@@ -1835,7 +1546,7 @@ class SensorService : Service(), SensorEventListener {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        Log.i(TAG, "onTaskRemoved — FGS rămâne până la Stop (fără restart din alarm)")
+        Log.i(TAG, "onTaskRemoved, FGS stays until Stop (no restart from alarm)")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

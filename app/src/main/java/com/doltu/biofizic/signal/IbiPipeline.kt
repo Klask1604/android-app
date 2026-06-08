@@ -3,7 +3,7 @@ package com.doltu.biofizic.signal
 import kotlin.math.abs
 import kotlin.math.sqrt
 
-/** Un interval IBI (ms) cu timestamp senzor — pentru fereastră HRV pe timp. */
+/** One IBI interval (ms) with a sensor timestamp, for the time-based HRV window. */
 data class IbiWindowEntry(
     val ibiMs: Int,
     val ts: Long,
@@ -14,8 +14,8 @@ data class IbiWindowEntry(
 data class TimedSample(val ts: Long, val value: Double)
 
 /**
- * Filtru minim IBI: status Samsung + interval fiziologic (ms).
- * Range 300–2000 ms aliniat cu server; outlier median 20% doar server-side.
+ * Minimal IBI filter: Samsung status + physiological interval (ms).
+ * Range 300-2000 ms aligned with the server; 20% median outlier rule is server-side only.
  */
 object IbiSignalFilter {
 
@@ -26,7 +26,7 @@ object IbiSignalFilter {
 
     // Empirically: Samsung's HR_CONTINUOUS marks bad beats with status == -1 in
     // the dataset's IBI_STATUS_LIST (verified on GalaxyPPG and our own live
-    // sessions — typical -1 intervals are 260 ms or 1600 ms, physiologically
+    // sessions, typical -1 intervals are 260 ms or 1600 ms, physiologically
     // impossible). Earlier this filter accepted -1 thinking Samsung was just
     // signalling "low confidence" on a still-usable beat; that was wrong.
     // Rejecting -1 cuts the published artifact_rate roughly in half on motion
@@ -36,7 +36,7 @@ object IbiSignalFilter {
 
     fun isPhysiological(ibiMs: Int): Boolean = ibiMs in MIN_IBI_MS..MAX_IBI_MS
 
-    /** GW7 poate trimite 62 în loc de 620 ms — scalare ×10 când e plauzibil. */
+    /** GW7 may send 62 instead of 620 ms; scale x10 when plausible. */
     fun normalizeIbiMs(raw: Int, hrBpm: Int): Int {
         if (raw in MIN_IBI_MS..MAX_IBI_MS) return raw
         if (raw in 30..250) {
@@ -78,7 +78,7 @@ object IbiSignalFilter {
      * Evaluate a raw beat, returning a best-effort duration even when rejected.
      * A status-rejected beat still carries a duration estimate: the normalized
      * raw value when it lands in a plausible band, otherwise the expected IBI
-     * from HR (60000/hr), otherwise 0 (clock simply does not advance — no worse
+     * from HR (60000/hr), otherwise 0 (clock simply does not advance, no worse
      * than today's behaviour).
      */
     fun evaluateBeat(rawIbiMs: Int, status: Int?, hrBpm: Int): BeatEval {
@@ -99,7 +99,7 @@ object IbiSignalFilter {
 
 /**
  * Feature-uri HRV locale pentru signalOk UI (verdict final pe server).
- * [windowSec] = sumă IBI valide / 1000 → durată cardiacă acoperită de fereastră.
+ * [windowSec] = sum of valid IBI / 1000 = cardiac duration covered by the window.
  */
 object HrvFeatureCalculator {
 
@@ -115,7 +115,7 @@ object HrvFeatureCalculator {
 
     private const val MIN_IBI_MS = IbiSignalFilter.MIN_IBI_MS
     private const val MAX_IBI_MS = IbiSignalFilter.MAX_IBI_MS
-    // Cross-codebase constants — keep equal to biofizic/config.py:
+    // Cross-codebase constants, keep equal to biofizic/config.py:
     //   MAX_IBI_TS_MISMATCH_MS  <- MAX_TIMESTAMP_IBI_MISMATCH_MS
     //   OUTLIER_MEDIAN_DEVIATION_RATIO, PNN50_THRESHOLD_MS
     private const val MAX_IBI_TS_MISMATCH_MS = 250L

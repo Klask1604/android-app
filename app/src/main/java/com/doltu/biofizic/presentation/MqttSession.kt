@@ -29,6 +29,10 @@ class MqttSession(
     private val tag: String = "MqttSession",
     private val onEpochState: (String) -> Unit,
     private val onStateLive: (String) -> Unit,
+    /** Emotion verdict: arousal-level state (Relaxat/Normal/"Stres sau Entuziasm")
+     *  + typical emotions + raw arousal/valence scores. Polarity is named only when
+     *  the morphology makes it reliable; otherwise the verdict reports the zone. */
+    private val onEmotionState: (String) -> Unit = {},
     private val onCalibrationStatus: (String) -> Unit,
     /** Handshake reply: the server's ok/error verdict on our announced sensors. */
     private val onHelloAck: (String) -> Unit = {},
@@ -77,10 +81,11 @@ class MqttSession(
                         val json = message.payload.decodeToString()
                         when (topic) {
                             // Retained bootstrap on reconnect plus fresh 30 s epochs.
-                            "biofizic/state" -> onEpochState(json)
-                            "biofizic/state/live" -> onStateLive(json)
-                            "biofizic/calibration/status" -> onCalibrationStatus(json)
-                            "biofizic/hello/ack" -> onHelloAck(json)
+                            Topics.Out.AROUSAL -> onEpochState(json)
+                            Topics.Out.LIVE -> onStateLive(json)
+                            Topics.Out.EMOTION -> onEmotionState(json)
+                            Topics.Out.CALIBRATION -> onCalibrationStatus(json)
+                            Topics.Out.HELLO_ACK -> onHelloAck(json)
                         }
                     } catch (e: Exception) {
                         Log.w(tag, "MQTT parse $topic: ${e.message}")
@@ -91,12 +96,13 @@ class MqttSession(
             client.connect(options)
             // QoS 1 on biofizic/state so the retained bootstrap survives a
             // reconnect; live updates and calibration status can drop one.
-            client.subscribe("biofizic/state", 1)
-            client.subscribe("biofizic/state/live", 0)
-            client.subscribe("biofizic/calibration/status", 1)
+            client.subscribe(Topics.Out.AROUSAL, 1)
+            client.subscribe(Topics.Out.LIVE, 0)
+            client.subscribe(Topics.Out.EMOTION, 0)
+            client.subscribe(Topics.Out.CALIBRATION, 1)
             // Handshake reply: QoS 1 so the ack survives a reconnect.
-            client.subscribe("biofizic/hello/ack", 1)
-            Log.i(tag, "MQTT connected to $brokerUrl (+ state, state/live, calibration/status, hello/ack)")
+            client.subscribe(Topics.Out.HELLO_ACK, 1)
+            Log.i(tag, "MQTT connected to $brokerUrl (+ arousal, live, emotion, calibration, hello/ack)")
             return true
         } catch (e: Exception) {
             Log.e(tag, "MQTT connect error on $brokerUrl: ${e.message}")

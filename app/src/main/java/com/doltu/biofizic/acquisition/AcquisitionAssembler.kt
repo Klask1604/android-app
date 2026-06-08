@@ -16,8 +16,8 @@ import kotlin.math.sqrt
  * motion stats aligned to the same wall-clock window.
  *
  * Atomic sync, in one place: the Samsung Health SDK gives each tracker its
- * own delivery cadence (HR at ~4 s bursts, PPG at ~25 Hz, motion polled at
- * 1 Hz). The HRV math on the server needs every metric in the payload to
+ * own delivery cadence (HR at ~4 s bursts, PPG at 100 Hz in bursts, motion
+ * at ~25 Hz). The HRV math on the server needs every metric in the payload to
  * refer to the same time window. To get that, the assembler:
  *
  *   1. Walks IBI timestamps backwards from a known anchor in
@@ -72,24 +72,14 @@ class AcquisitionAssembler(
     )
 
     private val bufferLock = Any()
-    private val ppgBatchLock = Any()
-    private val ppgBatch = mutableListOf<Triple<Long, Int, Int>>()  // (ts_ms, green, ir)
 
     // 100 Hz on-demand PPG buffer (valence). The Samsung tracker fires
     // onDataReceived every ~14 ms; publishing each callback would wake the radio
     // ~70x/s and drain the battery. We buffer here and flush ONE aggregated
-    // message per publish tick (~1 s) — the sensor still runs at 100 Hz so
+    // message per publish tick (~1 s), the sensor still runs at 100 Hz so
     // valence quality/latency is unchanged, only the radio wake-ups collapse.
     private val ppgOnDemandLock = Any()
     private val ppgOnDemand = mutableListOf<Triple<Long, Int, Int>>()  // (ts_ms, green, ir)
-
-    // ECG calibration buffer (raw 500 Hz Lead-I, finger on the button). Like the
-    // PPG on-demand buffer: the tracker fires fast bursts; we buffer and flush ONE
-    // aggregated message per publish tick to the server, which detects R-peaks ->
-    // IBI -> a clean arousal baseline. Only filled while a calibration is active.
-    data class EcgSample(val ts: Long, val mv: Int, val leadOff: Int, val seq: Int)
-    private val ecgCalibrationLock = Any()
-    private val ecgCalibration = mutableListOf<EcgSample>()
 
     private val ibiWindow = ArrayDeque<IbiWindowEntry>(220)
     // IBI accepted since the previous publish. HR ships in ~4 s bursts and we
@@ -144,28 +134,6 @@ class AcquisitionAssembler(
         }
     }
 
-    /** Buffer one raw PPG sample (research only; gated by PUBLISH_RAW_PPG). */
-    fun addPpgSample(ts: Long, green: Int, ir: Int) {
-        synchronized(ppgBatchLock) {
-            ppgBatch.add(Triple(ts, green, ir))
-            // Cap so a missed publish can't grow it unbounded (~2 s @ 25 Hz x safety).
-            while (ppgBatch.size > 1500) ppgBatch.removeAt(0)
-        }
-    }
-
-    /**
-     * Drain ALL PPG buffered since the previous publish (not just the last 1 s).
-     * The Samsung PPG tracker delivers in bursts, so a fixed 1 s slice dropped
-     * most samples — mirror the IBI drain so every sample reaches the server.
-     */
-    fun drainPpgForPublish(): List<Triple<Long, Int, Int>> {
-        synchronized(ppgBatchLock) {
-            val snap = ppgBatch.toList()
-            ppgBatch.clear()
-            return snap
-        }
-    }
-
     /** Buffer one 100 Hz on-demand PPG sample (valence). Flushed once per publish
      *  tick by [drainPpgOnDemandForPublish] instead of per-callback. */
     fun addPpgOnDemandSample(ts: Long, green: Int, ir: Int) {
@@ -185,24 +153,6 @@ class AcquisitionAssembler(
         }
     }
 
-    /** Buffer one 500 Hz ECG calibration sample. Flushed once per publish tick. */
-    fun addEcgCalibrationSample(ts: Long, mv: Int, leadOff: Int, seq: Int) {
-        synchronized(ecgCalibrationLock) {
-            ecgCalibration.add(EcgSample(ts, mv, leadOff, seq))
-            // Cap ~1.2 s @ 500 Hz x safety so a missed flush can't grow unbounded.
-            while (ecgCalibration.size > 600) ecgCalibration.removeAt(0)
-        }
-    }
-
-    /** Drain all ECG calibration samples buffered since the previous flush. */
-    fun drainEcgCalibrationForPublish(): List<EcgSample> {
-        synchronized(ecgCalibrationLock) {
-            val snap = ecgCalibration.toList()
-            ecgCalibration.clear()
-            return snap
-        }
-    }
-
     /** Drop everything. Called on stop and on baseline recalibration. */
     fun clear() {
         synchronized(bufferLock) {
@@ -212,9 +162,7 @@ class AcquisitionAssembler(
             gyroDynSamples.clear()
             lastIbiTimestampMs = 0L
         }
-        synchronized(ppgBatchLock) { ppgBatch.clear() }
         synchronized(ppgOnDemandLock) { ppgOnDemand.clear() }
-        synchronized(ecgCalibrationLock) { ecgCalibration.clear() }
         acquisitionSeq = 0L
         lastSkinTempTsMs = 0L
     }

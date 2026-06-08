@@ -35,7 +35,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.size
@@ -186,7 +185,7 @@ private val AccentIdle = Color(0xFF5C6370)
 private val BtnStart = Color(0xFF00C853)
 private val BtnStop = Color(0xFFD50000)
 
-/** Zonă sigură pe ecran rotund (~65% din diametru). */
+/** Safe zone on a round screen (~65% of the diameter). */
 private const val SAFE_WIDTH_FRACTION = 0.62f
 
 @Composable
@@ -248,7 +247,7 @@ fun BiofizicWatchApp() {
                     modifier = Modifier.align(Alignment.Center).width(contentW),
                 )
             } else {
-                // One centered column: info on top, buttons below — no overlap.
+                // One centered column: info on top, buttons below, no overlap.
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
@@ -263,13 +262,13 @@ fun BiofizicWatchApp() {
                         arousalFused = uiState.arousalFused,
                         arousal10 = uiState.arousal10,
                         arousalLabel = uiState.arousalLabel,
-                        confidence = uiState.arousalConfidence,
-                        dominantChannel = uiState.dominantChannel,
+                        emotionVerdict = uiState.emotionVerdict,
+                        emotionScores = uiState.emotionScores,
+                        emotionConfidence = uiState.emotionConfidence,
                         motionGated = uiState.motionGated,
                         profileReady = uiState.profileReady,
                         signalOk = uiState.signalOk,
                         decisionFidelity = uiState.decisionFidelity,
-                        windowSec = uiState.lastWindowSec.toFloat(),
                         calibrating = uiState.calibrationPhase == "collecting",
                         calMessage = uiState.calibrationMessage,
                         contentWidth = contentW,
@@ -324,7 +323,7 @@ fun BiofizicWatchApp() {
                                     )
                                 } else {
                                     // Plain start: just begin tracking with the
-                                    // persisted baseline — no questionnaire, no
+                                    // persisted baseline, no questionnaire, no
                                     // recalibration. Recalibrate only via the
                                     // yellow button.
                                     context.startForegroundService(
@@ -391,7 +390,7 @@ private fun StopGlyph() {
 
 @Composable
 private fun FeedbackGlyph() {
-    // A simple smiley: outline circle + two eyes + a smile arc — the "label how
+    // A simple smiley: outline circle + two eyes + a smile arc, the "label how
     // you feel" affordance.
     Canvas(modifier = Modifier.size(16.dp)) {
         val stroke = 1.6.dp.toPx()
@@ -438,6 +437,55 @@ private fun RecalibrateGlyph() {
     }
 }
 
+/** Filled heart, the heart-rate metric icon. */
+@Composable
+private fun HeartIcon(color: Color, size: Dp = 13.dp) {
+    Canvas(modifier = Modifier.size(size)) {
+        val w = this.size.width
+        val h = this.size.height
+        val p = Path().apply {
+            moveTo(w * 0.5f, h * 0.86f)
+            // left lobe
+            cubicTo(w * 0.10f, h * 0.58f, w * 0.04f, h * 0.30f, w * 0.26f, h * 0.20f)
+            cubicTo(w * 0.40f, h * 0.13f, w * 0.50f, h * 0.24f, w * 0.5f, h * 0.34f)
+            // right lobe (mirror)
+            cubicTo(w * 0.50f, h * 0.24f, w * 0.60f, h * 0.13f, w * 0.74f, h * 0.20f)
+            cubicTo(w * 0.96f, h * 0.30f, w * 0.90f, h * 0.58f, w * 0.5f, h * 0.86f)
+            close()
+        }
+        drawPath(p, color)
+    }
+}
+
+/** A small running figure, the motion-state icon (calm vs moving). */
+@Composable
+private fun MotionIcon(color: Color, size: Dp = 13.dp) {
+    Canvas(modifier = Modifier.size(size)) {
+        val w = this.size.width
+        val h = this.size.height
+        val stroke = 1.7.dp.toPx()
+        // head
+        drawCircle(color, radius = w * 0.10f, center = Offset(w * 0.62f, h * 0.18f))
+        // torso + legs (running stance)
+        val body = Path().apply {
+            moveTo(w * 0.62f, h * 0.30f)
+            lineTo(w * 0.50f, h * 0.55f)   // torso down
+            lineTo(w * 0.30f, h * 0.78f)   // back leg
+            moveTo(w * 0.50f, h * 0.55f)
+            lineTo(w * 0.62f, h * 0.82f)   // front leg
+        }
+        drawPath(body, color, style = Stroke(width = stroke, cap = StrokeCap.Round))
+        // arms
+        val arms = Path().apply {
+            moveTo(w * 0.58f, h * 0.40f)
+            lineTo(w * 0.36f, h * 0.46f)   // back arm
+            moveTo(w * 0.58f, h * 0.40f)
+            lineTo(w * 0.80f, h * 0.34f)   // front arm
+        }
+        drawPath(arms, color, style = Stroke(width = stroke, cap = StrokeCap.Round))
+    }
+}
+
 @Composable
 private fun EmotionQuestionnaire(
     contentWidth: Dp,
@@ -445,25 +493,26 @@ private fun EmotionQuestionnaire(
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    // The user labels how they feel RIGHT NOW with a full Russell quadrant. This
-    // is the ground-truth the models are validated against (and later, maybe,
-    // trained on). One tap = one labelled training pair.
-    val quadrants = listOf(
-        "Bucuros" to Color(0xFFB8860B),
-        "Calm" to Color(0xFF2E7D32),
-        "Trist" to Color(0xFF1565C0),
-        "Stresat" to Color(0xFFC62828),
+    // The user labels how they feel RIGHT NOW with one of the 3 model states. This
+    // is the ground-truth the models are validated against and the personal model is
+    // trained on. One tap = one labelled training pair. The display has the accented
+    // word; the value sent is the canonical state the server's model uses (no
+    // diacritics): Calm / Disconfort / Placut, matching STATE_CODE on the server.
+    val states = listOf(
+        Triple("Plăcut", "Placut", Color(0xFFB8860B)),
+        Triple("Calm", "Calm", Color(0xFF2E7D32)),
+        Triple("Disconfort", "Disconfort", Color(0xFFC62828)),
     )
     Column(modifier = modifier, horizontalAlignment = Alignment.CenterHorizontally) {
         Text("Cum te simți acum?", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary)
         Spacer(Modifier.height(6.dp))
-        quadrants.forEach { (label, color) ->
+        states.forEach { (display, value, color) ->
             Button(
-                onClick = { onDone(label) },
+                onClick = { onDone(value) },
                 colors = ButtonDefaults.buttonColors(backgroundColor = color),
                 modifier = Modifier.width(contentWidth).height(26.dp).padding(vertical = 2.dp),
             ) {
-                Text(label, fontSize = 11.sp, color = Color.White)
+                Text(display, fontSize = 11.sp, color = Color.White)
             }
         }
     }
@@ -498,6 +547,16 @@ private fun MoodQuestionnaire(
                     Text(label, fontSize = 11.sp, color = TextPrimary)
                 }
             }
+            // Escape hatch: an accidental recalibrate is never a trap.
+            Spacer(Modifier.height(3.dp))
+            Text(
+                "✕ Anulează",
+                fontSize = 10.sp,
+                color = TextMuted,
+                modifier = Modifier
+                    .clickable { onCancel() }
+                    .padding(4.dp),
+            )
         } else {
             Text("Cât de reactiv emoțional ești?", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary)
             Spacer(Modifier.height(6.dp))
@@ -511,7 +570,17 @@ private fun MoodQuestionnaire(
                 }
             }
             Spacer(Modifier.height(2.dp))
-            Text("apoi stai liniștit 1–2 min", fontSize = 8.sp, color = TextMuted)
+            Text("apoi stai liniștit 1-2 min", fontSize = 8.sp, color = TextMuted)
+            // Back to step 1 (re-pick arousal) instead of being forced forward.
+            Spacer(Modifier.height(2.dp))
+            Text(
+                "‹ Înapoi",
+                fontSize = 10.sp,
+                color = TextMuted,
+                modifier = Modifier
+                    .clickable { pickedArousal = null }
+                    .padding(4.dp),
+            )
         }
     }
 }
@@ -525,13 +594,13 @@ private fun WatchFaceContent(
     arousalFused: Float,
     arousal10: Int,
     arousalLabel: String,
-    confidence: Float,
-    dominantChannel: String,
+    emotionVerdict: String,
+    emotionScores: String,
+    emotionConfidence: Float,
     motionGated: Boolean,
     profileReady: Boolean,
     signalOk: Boolean,
     decisionFidelity: String,
-    windowSec: Float,
     calibrating: Boolean,
     calMessage: String,
     contentWidth: Dp,
@@ -581,8 +650,8 @@ private fun WatchFaceContent(
         ) {
             if (calibrating) {
                 // While the profile calibrates there is no score yet: one short
-                // row — "Calibrare" on the left, the rotating loader on the right
-                // — so it keeps the card height and does not push the buttons down.
+                // row, "Calibrare" on the left, the rotating loader on the right
+                //, so it keeps the card height and does not push the buttons down.
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -596,57 +665,115 @@ private fun WatchFaceContent(
                     CalibrationSpinner(accent = accent, size = 20.dp)
                 }
             } else {
+                // Emotion-first layout: the verdict is the hero (large), the arousal
+                // score + bar sit smaller above it, and the two-axis scores + verdict
+                // confidence sit quietly below. One column, fixed heights, no overflow.
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    // Compact arousal line: number + /10 + label, all on one short row.
                     Row(verticalAlignment = Alignment.Bottom) {
                         Text(
                             text = bigValue,
-                            fontSize = 22.sp,
+                            fontSize = 15.sp,
                             fontWeight = FontWeight.Bold,
                             color = TextPrimary,
-                            lineHeight = 22.sp,
+                            lineHeight = 15.sp,
                         )
                         Text(
-                            text = "/10  ",
-                            fontSize = 8.sp,
+                            text = "/10 ",
+                            fontSize = 7.sp,
                             color = TextMuted,
-                            modifier = Modifier.padding(bottom = 3.dp),
+                            modifier = Modifier.padding(bottom = 2.dp),
                         )
                         Text(
                             text = statusText,
-                            fontSize = 11.sp,
+                            fontSize = 9.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = accent,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.padding(bottom = 2.dp),
+                            modifier = Modifier.padding(bottom = 1.dp),
                         )
                     }
-                    Spacer(modifier = Modifier.height(4.dp))
+                    Spacer(modifier = Modifier.height(3.dp))
                     ArousalBar(
                         fraction = if (hasVerdict) arousalFused / 10f else 0f,
                         accent = accent,
                     )
+
+                    // THE HERO: the emotion verdict, large and centered.
+                    if (hasVerdict && emotionVerdict.isNotBlank() &&
+                        emotionVerdict != "—" && emotionVerdict != "-"
+                    ) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = emotionVerdict,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = accent,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            textAlign = TextAlign.Center,
+                            lineHeight = 17.sp,
+                        )
+                        // The two affective axes (arousal + valence), always shown,
+                        // valence marked "~" when the server could not assert it.
+                        if (emotionScores.isNotBlank()) {
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = emotionScores,
+                                fontSize = 8.sp,
+                                color = TextMuted,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                textAlign = TextAlign.Center,
+                            )
+                        }
+                        // The verdict's OWN confidence (not the arousal one).
+                        if (emotionConfidence > 0f) {
+                            Text(
+                                text = "încredere ${(emotionConfidence * 100).toInt()}%",
+                                fontSize = 8.sp,
+                                color = TextMuted,
+                                maxLines = 1,
+                                textAlign = TextAlign.Center,
+                            )
+                        }
+                    }
                 }
             }
         }
 
-        Spacer(modifier = Modifier.height(6.dp))
+        Spacer(modifier = Modifier.height(9.dp))
 
-        // Metrics stacked, one per line — readable, no edge wrap.
-        MetricRow("Ritm", if (hr > 0) "$hr bpm" else "—")
-        Spacer(modifier = Modifier.height(3.dp))
-        val channelTag = when (dominantChannel) {
-            "hr" -> " · HR"      // motion: verdict carried by heart rate
-            "blend" -> " · mix"
-            "none" -> " · —"
-            else -> ""           // "hrv": still/precise, no tag needed
+        // Compact metrics row with vector icons: heart-rate + motion state, one line.
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(20.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+            ) {
+                HeartIcon(color = Color(0xFFFF5E7A))
+                Text(
+                    text = if (hr > 0) "$hr" else "—",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = TextPrimary,
+                )
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+            ) {
+                MotionIcon(color = if (motionGated) AccentMotion else AccentActive)
+                Text(
+                    text = if (motionGated) "mișcare" else "calm",
+                    fontSize = 12.sp,
+                    color = TextMuted,
+                )
+            }
         }
-        MetricRow(
-            "Încredere",
-            if (hasVerdict) "${(confidence * 100).toInt()}%$channelTag" else "—",
-        )
-        Spacer(modifier = Modifier.height(3.dp))
-        MetricRow("Stare", if (motionGated) "mișcare" else "calm")
     }
 }
 
@@ -709,24 +836,7 @@ private fun ArousalBar(fraction: Float, accent: Color) {
     }
 }
 
-/** Full-width metric row: label on the left, value on the right. */
-@Composable
-private fun MetricRow(label: String, value: String) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(9.dp))
-            .background(Color(0xFF1A1F2B))
-            .padding(horizontal = 10.dp, vertical = 4.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(label, fontSize = 9.sp, color = TextMuted)
-        Text(value, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary)
-    }
-}
-
-/** Un singur rând îngust — nu iese în marginile rotunde. */
+/** A single narrow row that stays clear of the round edges. */
 @Composable
 private fun CompactStatusLine(
     isRunning: Boolean,
@@ -744,7 +854,7 @@ private fun CompactStatusLine(
     }
     // Server-side fidelity is the source of truth once a verdict exists.
     // "preliminary" means we already show arousal_10 (Kubios population
-    // fallback) — display it as motion-yellow with "~" suffix so the user
+    // fallback), display it as motion-yellow with "~" suffix so the user
     // sees the verdict immediately AND knows it isn't personalised yet.
     // "calibrated" + profileReady → green "OK". This replaces the old
     // 6-min spinner that hid arousal until baseline locked.

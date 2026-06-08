@@ -127,7 +127,7 @@ class AcquisitionAssemblerTest {
         )
         val (_, ts, _) = a.buildIbiTimestampsWithGaps(evals, dpMs, dpMs + 1)
         // The inter-beat gap between the two survivors is 810 + 600 = 1410 ms,
-        // which differs from the later beat's IBI (810 ms) by 600 ms — far
+        // which differs from the later beat's IBI (810 ms) by 600 ms, far
         // above MAX_TIMESTAMP_IBI_MISMATCH_MS (250). The server's coherence
         // check will therefore drop this pair from RMSSD, which is the point.
         val gap = ts[1] - ts[0]

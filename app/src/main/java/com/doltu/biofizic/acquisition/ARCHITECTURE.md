@@ -6,7 +6,7 @@ field in one packet refers to the same time window, anchored by a shared `ts_anc
 
 ## Inputs
 - Accepted `IbiWindowEntry` beats (from `signal/`).
-- Per-second buffers of accelerometer / gyroscope samples + raw PPG (~25 Hz) + skin temp,
+- Per-second buffers of accelerometer / gyroscope samples (~25 Hz) + raw PPG (100 Hz) + skin temp,
   pushed by `presentation/SensorService.kt` from SDK / Android sensor threads.
 
 ## Outputs
@@ -33,5 +33,5 @@ acquisition/batch payload ─▶ PublishScheduler ─▶ MQTT
 ## Depends on / Used by
 - **Depends on:** `signal/` (beats), kotlin math (FFT energy).
 - **Used by:** `presentation/SensorService.kt` + `PublishScheduler.kt`; consumed server-side by `biofizic/ingestion`.
-- Why atomic: the SDK delivers each tracker at a different cadence (HR ~4s bursts, PPG ~25 Hz);
+- Why atomic: the SDK delivers each tracker at a different cadence (HR ~4s bursts, PPG 100 Hz in bursts);
   `ts_anchor` lets the server align its 30s HRV window to the instant the watch saw.
